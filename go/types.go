@@ -80,6 +80,134 @@ type Passage struct {
 	Score      float64 `json:"score"`
 }
 
+// KnowledgeIndex is how indexing of a document stands.
+type KnowledgeIndex struct {
+	// Status is queued, indexing, ready or failed.
+	Status string `json:"status"`
+	// Error is why the last pass failed. Indexing is tried again on its own.
+	Error     string  `json:"error,omitempty"`
+	IndexedAt *string `json:"indexed_at"`
+	Chunks    int     `json:"chunks"`
+	Tokens    int     `json:"tokens"`
+}
+
+// Document is one document of the agent's knowledge base.
+type Document struct {
+	ID        string  `json:"id"`
+	Kind      string  `json:"kind"`
+	Title     string  `json:"title"`
+	SourceURL *string `json:"source_url"`
+	Language  string  `json:"language"`
+	IsActive  bool    `json:"is_active"`
+	// Content is left out of a list.
+	Content string         `json:"content,omitempty"`
+	Data    map[string]any `json:"data,omitempty"`
+	Index   KnowledgeIndex `json:"index"`
+	// Version is the knowledge version of the document's last index.
+	Version   int64  `json:"version"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// DocumentInput is a new document. Kind is text when left empty.
+type DocumentInput struct {
+	App       string         `json:"app,omitempty"`
+	Title     string         `json:"title"`
+	Content   string         `json:"content,omitempty"`
+	Kind      string         `json:"kind,omitempty"`
+	SourceURL string         `json:"source_url,omitempty"`
+	Data      map[string]any `json:"data,omitempty"`
+	Language  string         `json:"language,omitempty"`
+	IsActive  *bool          `json:"is_active,omitempty"`
+}
+
+// DocumentPatch changes a document. A nil field is left alone.
+type DocumentPatch struct {
+	App       string         `json:"app,omitempty"`
+	Title     *string        `json:"title,omitempty"`
+	Content   *string        `json:"content,omitempty"`
+	Kind      *string        `json:"kind,omitempty"`
+	SourceURL *string        `json:"source_url,omitempty"`
+	Data      map[string]any `json:"data,omitempty"`
+	Language  *string        `json:"language,omitempty"`
+	IsActive  *bool          `json:"is_active,omitempty"`
+}
+
+// ListOptions pages a document list. The zero value is the first page.
+type ListOptions struct {
+	Cursor string
+	Limit  int
+	App    string
+}
+
+// DocumentPage is one page of documents, newest first.
+type DocumentPage struct {
+	Documents []Document `json:"documents"`
+	// NextCursor is empty on the last page.
+	NextCursor string `json:"next_cursor"`
+	// Version is the agent's knowledge version now.
+	Version int64 `json:"version"`
+}
+
+// SourceInput is a website to crawl into the knowledge base.
+type SourceInput struct {
+	App      string `json:"app,omitempty"`
+	RootURL  string `json:"root_url"`
+	MaxPages int    `json:"max_pages,omitempty"`
+	MaxDepth int    `json:"max_depth,omitempty"`
+}
+
+// ExportOptions asks for changes. Since nil exports everything indexed; set it
+// to the Version a previous export returned to get only what changed.
+type ExportOptions struct {
+	Since  *int64
+	Cursor string
+	Limit  int
+	App    string
+}
+
+// ExportedChunk is one passage of a document, as search holds it.
+type ExportedChunk struct {
+	Ordinal  int    `json:"ordinal"`
+	Text     string `json:"text"`
+	Tokens   int    `json:"tokens"`
+	Checksum string `json:"checksum"`
+}
+
+// ExportedDocument is a changed document with its passages. One that was
+// switched off has IsActive false and no passages: drop it from your copy.
+type ExportedDocument struct {
+	ID        string          `json:"id"`
+	Kind      string          `json:"kind"`
+	Title     string          `json:"title"`
+	SourceURL *string         `json:"source_url"`
+	Language  string          `json:"language"`
+	IsActive  bool            `json:"is_active"`
+	Version   int64           `json:"version"`
+	UpdatedAt string          `json:"updated_at"`
+	Chunks    []ExportedChunk `json:"chunks"`
+}
+
+// DeletedDocument is a document that no longer exists.
+type DeletedDocument struct {
+	ID      string `json:"id"`
+	Version int64  `json:"version"`
+}
+
+// KnowledgeExport is one page of changes.
+type KnowledgeExport struct {
+	// Version is what the export is complete up to. Pass it as Since next time.
+	Version   int64              `json:"version"`
+	Documents []ExportedDocument `json:"documents"`
+	// Deleted is sent with the first page when Since was given.
+	Deleted []DeletedDocument `json:"deleted"`
+	// Resync is true when too much was deleted to list: drop your copy and
+	// export again without Since.
+	Resync bool `json:"resync"`
+	// NextCursor is empty on the last page.
+	NextCursor string `json:"next_cursor"`
+}
+
 // HistoryTurn is an earlier turn of the caller's own conversation.
 type HistoryTurn struct {
 	Role string `json:"role"`
@@ -178,7 +306,8 @@ type CallStatus struct {
 	LastError   string         `json:"last_error,omitempty"`
 }
 
-// VoiceJobRequest starts a background voice task. Kind is "transcribe" or "notes".
+// VoiceJobRequest starts a background voice task. Kind is "transcribe" or
+// "meeting_notes".
 type VoiceJobRequest struct {
 	App          string   `json:"app,omitempty"`
 	Kind         string   `json:"kind"`

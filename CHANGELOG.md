@@ -2,6 +2,18 @@
 
 The TypeScript, Python and Go clients share one version number.
 
+## 0.2.0 (2026-11-20)
+
+Knowledge documents. Nothing in 0.1.0 changed its name or its shape.
+
+- Read and write the agent's knowledge base: list, read, add, change and delete a document, with how its indexing stands (`queued`, `indexing`, `ready`, `failed`). Reads need `kb:read`, writes `kb:write`.
+- Upload a file (PDF, spreadsheet, image or text) as a document.
+- List the websites a knowledge base is crawled from, add one, and crawl it again.
+- Export what changed in the knowledge base since a version, with the passages search uses, to keep a copy of your own.
+- The body of the `kb.updated` event is typed in the TypeScript client (`KnowledgeUpdatedEvent`). Verify it with the signature helper every client already has.
+- Knowledge writes are never sent again by a client after a failure. The reads are, as other reads are.
+- Fixed: the TypeScript and Go types named a voice job kind `notes`. The API takes `transcribe` and `meeting_notes`.
+
 ## 0.1.0 (2026-11-19)
 
 First release.

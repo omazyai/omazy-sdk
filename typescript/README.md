@@ -18,7 +18,7 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.1.0/omazyai-sdk-0.1.0.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.2.0/omazyai-sdk-0.2.0.tgz
 ```
 
 ## Use
@@ -46,6 +46,8 @@ The token is a Core API token (`cai_...`). A workspace owner creates it and choo
 | `whoami()` | none |
 | `ai.complete(req)`, `ai.stream(req)` | `ai:complete` |
 | `knowledge.search(query, opts)` | `kb:search` |
+| `knowledge.documents.list(opts)`, `knowledge.documents.get(id)`, `knowledge.sources.list()`, `knowledge.export(opts)` | `kb:read` |
+| `knowledge.documents.create(doc)`, `.update(id, patch)`, `.delete(id)`, `knowledge.importFile(file, opts)`, `knowledge.sources.create(req)`, `.crawl(id)` | `kb:write` |
 | `agent.turn(req)` | `agent:run` |
 | `voice.speak(text, opts)`, `voice.transcribe(audio, opts)` | `voice:speech` |
 | `voice.calls.place(req)`, `voice.calls.get(ref)` | `voice:calls` |
@@ -56,6 +58,32 @@ The token is a Core API token (`cai_...`). A workspace owner creates it and choo
 | `channels.linkedinPublish(req)` | `channels:publish` |
 | `sessions.bindCredential(...)`, `sessions.unbindCredential(...)` | `sessions:credentials` |
 | `mcp.listTools()`, `mcp.callTool(name, args)`, `mcp.config()` | the tool's own scope |
+
+## Writing knowledge
+
+A document is indexed in the background. `index.status` goes from `queued` to `ready`, or to `failed` with a reason.
+
+```ts
+const doc = await omazy.knowledge.documents.create({ title: 'Opening hours', content: 'Open 9 to 5, Sunday to Thursday.' })
+const file = await omazy.knowledge.importFile(pdfBytes, { filename: 'handbook.pdf', contentType: 'application/pdf' })
+
+const { index } = await omazy.knowledge.documents.get(doc.id) // index.status
+```
+
+To keep your own copy of the knowledge base, export everything once, then only what changed:
+
+```ts
+let cursor: string | undefined
+let version = 0
+do {
+  const page = await omazy.knowledge.export({ since: saved, cursor })
+  for (const d of page.documents) d.is_active ? store(d) : drop(d.id)
+  for (const d of page.deleted) drop(d.id)
+  version = page.version
+  cursor = page.next_cursor || undefined
+} while (cursor)
+saved = version // pass it as since next time; leave since out the first time
+```
 
 ## Streaming
 

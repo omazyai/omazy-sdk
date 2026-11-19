@@ -125,6 +125,17 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 	c.Whoami(ctx)
 	c.AI.Complete(ctx, CompleteRequest{Messages: hi})
 	c.Knowledge.Search(ctx, "q", SearchOptions{})
+	c.Knowledge.ListDocuments(ctx, ListOptions{})
+	c.Knowledge.CreateDocument(ctx, DocumentInput{Title: "t", Content: "c"})
+	c.Knowledge.GetDocument(ctx, "c1", "")
+	title := "t2"
+	c.Knowledge.UpdateDocument(ctx, "c1", DocumentPatch{Title: &title})
+	c.Knowledge.DeleteDocument(ctx, "c1", "")
+	c.Knowledge.ImportFile(ctx, []byte{1, 2}, "a.pdf", "", "")
+	c.Knowledge.ListSources(ctx, "")
+	c.Knowledge.CreateSource(ctx, SourceInput{RootURL: "https://x.test"})
+	c.Knowledge.CrawlSource(ctx, "c1", "")
+	c.Knowledge.Export(ctx, ExportOptions{})
 	c.Agent.Turn(ctx, AgentTurnRequest{Message: "hi"})
 	c.Voice.Speak(ctx, "hi", "", "")
 	c.Voice.Transcribe(ctx, []byte{1, 2}, "", "")
@@ -159,7 +170,8 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 }
 
 func TestNothingThatChangesTheWorldIsRetried(t *testing.T) {
-	for _, name := range []string{"voice.calls.place", "conversations.post_message", "channels.linkedin_publish", "agent.turn", "customers.update", "voice.jobs.create", "mcp"} {
+	for _, name := range []string{"voice.calls.place", "conversations.post_message", "channels.linkedin_publish", "agent.turn", "customers.update", "voice.jobs.create", "mcp",
+		"knowledge.documents.create", "knowledge.documents.update", "knowledge.documents.delete", "knowledge.import_file", "knowledge.sources.create", "knowledge.sources.crawl"} {
 		if retryable[name] {
 			t.Errorf("%s must not be retried", name)
 		}
@@ -328,5 +340,71 @@ func TestSignature(t *testing.T) {
 		if bad {
 			t.Errorf("verified with %s", name)
 		}
+	}
+}
+
+func TestADocumentIsCreatedInTheDefaultAppWithItsIndexStatus(t *testing.T) {
+	f, c := newFake(t, ok(`{"id":"01A","title":"Hours","index":{"status":"queued","indexed_at":null,"chunks":0,"tokens":0},"version":0}`))
+	c.app = "desk"
+	doc, err := c.Knowledge.CreateDocument(ctx, DocumentInput{Title: "Hours", Content: "9 to 5"})
+	if err != nil || doc.ID != "01A" || doc.Index.Status != "queued" || doc.Index.IndexedAt != nil {
+		t.Fatalf("doc = %+v, err = %v", doc, err)
+	}
+	if got := f.seen[0]; got.method != "POST" || got.path != "/core/knowledge/documents" || got.body != `{"app":"desk","title":"Hours","content":"9 to 5"}` {
+		t.Fatalf("sent %+v", got)
+	}
+}
+
+func TestAPatchSendsOnlyTheFieldsGiven(t *testing.T) {
+	f, c := newFake(t, ok(`{"id":"01A","is_active":false}`))
+	off := false
+	if _, err := c.Knowledge.UpdateDocument(ctx, "01A", DocumentPatch{IsActive: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.seen[0]; got.method != "PATCH" || got.path != "/core/knowledge/documents/01A" || got.body != `{"is_active":false}` {
+		t.Fatalf("sent %+v", got)
+	}
+}
+
+func TestAFileIsSentAsTheRawBodyWithItsName(t *testing.T) {
+	f, c := newFake(t, ok(`{"id":"01F"}`))
+	if _, err := c.Knowledge.ImportFile(ctx, []byte("%PDF-1.7"), "hand book.pdf", "application/pdf", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.seen[0]; got.path != "/core/knowledge/import?filename=hand+book.pdf" || got.body != "%PDF-1.7" {
+		t.Fatalf("sent %+v", got)
+	}
+}
+
+func TestAnExportSendsSinceEvenWhenItIsZero(t *testing.T) {
+	f, c := newFake(t, ok(`{"version":12,"documents":[{"id":"01A","is_active":true,"version":9,"chunks":[{"ordinal":0,"text":"p","tokens":1,"checksum":"c"}]}],"deleted":[{"id":"01B","version":11}],"resync":false,"next_cursor":""}`))
+	ex, err := c.Knowledge.Export(ctx, ExportOptions{})
+	if err != nil || ex.Version != 12 || len(ex.Documents) != 1 || ex.Documents[0].Chunks[0].Text != "p" || ex.Deleted[0].ID != "01B" {
+		t.Fatalf("export = %+v, err = %v", ex, err)
+	}
+	if f.seen[0].path != "/core/knowledge/export" {
+		t.Fatalf("a full export sent %s", f.seen[0].path)
+	}
+	zero := int64(0)
+	if _, err := c.Knowledge.Export(ctx, ExportOptions{Since: &zero, Cursor: "12.4.01A", Limit: 20}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.seen[1].path; got != "/core/knowledge/export?cursor=12.4.01A&limit=20&since=0" {
+		t.Fatalf("sent %s", got)
+	}
+}
+
+func TestAKnowledgeWriteIsNeverSentTwiceAndAReadIs(t *testing.T) {
+	f, c := newFake(t, fail(503, "UPSTREAM_UNAVAILABLE", "try later"))
+	if err := c.Knowledge.DeleteDocument(ctx, "01A", ""); err == nil {
+		t.Fatal("a refused delete returned no error")
+	}
+	if len(f.seen) != 1 {
+		t.Fatalf("the delete was sent %d times", len(f.seen))
+	}
+	f, c = newFake(t, fail(429, "RATE_LIMITED", "slow down", "Retry-After", "1"), ok(`{"documents":[],"next_cursor":"","version":3}`))
+	page, err := c.Knowledge.ListDocuments(ctx, ListOptions{Limit: 10})
+	if err != nil || page.Version != 3 || len(f.seen) != 2 {
+		t.Fatalf("page = %+v, err = %v, sent %d times", page, err, len(f.seen))
 	}
 }

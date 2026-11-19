@@ -7,6 +7,16 @@ ROUTES = {
     "whoami": ("GET", "/whoami"),
     "ai.complete": ("POST", "/ai/complete"),
     "knowledge.search": ("POST", "/knowledge/search"),
+    "knowledge.documents.list": ("GET", "/knowledge/documents"),
+    "knowledge.documents.create": ("POST", "/knowledge/documents"),
+    "knowledge.documents.get": ("GET", "/knowledge/documents/{id}"),
+    "knowledge.documents.update": ("PATCH", "/knowledge/documents/{id}"),
+    "knowledge.documents.delete": ("DELETE", "/knowledge/documents/{id}"),
+    "knowledge.import_file": ("POST", "/knowledge/import"),
+    "knowledge.sources.list": ("GET", "/knowledge/sources"),
+    "knowledge.sources.create": ("POST", "/knowledge/sources"),
+    "knowledge.sources.crawl": ("POST", "/knowledge/sources/{id}/crawl"),
+    "knowledge.export": ("GET", "/knowledge/export"),
     "agent.turn": ("POST", "/agent/turn"),
     "voice.speak": ("POST", "/voice/speak"),
     "voice.transcribe": ("POST", "/voice/transcribe"),
@@ -25,13 +35,17 @@ ROUTES = {
 
 # Routes that are safe to send again after a 429, a gateway error or a dropped
 # connection: they read, or they compute an answer and change nothing. Placing a
-# call, posting a message, publishing and running an agent turn (which may fire
-# a tool) are never retried by the client.
+# call, posting a message, publishing, running an agent turn (which may fire a
+# tool) and writing knowledge are never retried by the client.
 RETRYABLE = frozenset(
     {
         "whoami",
         "ai.complete",
         "knowledge.search",
+        "knowledge.documents.list",
+        "knowledge.documents.get",
+        "knowledge.sources.list",
+        "knowledge.export",
         "voice.speak",
         "voice.transcribe",
         "voice.calls.get",

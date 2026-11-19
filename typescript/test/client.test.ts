@@ -50,6 +50,16 @@ describe('contract', () => {
     await o.whoami()
     await o.ai.complete({ messages: [{ role: 'user', content: 'hi' }] })
     await o.knowledge.search('q')
+    await o.knowledge.documents.list()
+    await o.knowledge.documents.create({ title: 't', content: 'c' })
+    await o.knowledge.documents.get('c1')
+    await o.knowledge.documents.update('c1', { title: 't2' })
+    await o.knowledge.documents.delete('c1')
+    await o.knowledge.importFile(new Uint8Array([1, 2]), { filename: 'a.pdf' })
+    await o.knowledge.sources.list()
+    await o.knowledge.sources.create({ root_url: 'https://x.test' })
+    await o.knowledge.sources.crawl('c1')
+    await o.knowledge.export()
     await o.agent.turn({ message: 'hi' })
     await o.voice.speak('hi')
     await o.voice.transcribe(new Uint8Array([1, 2]))
@@ -73,7 +83,7 @@ describe('contract', () => {
   })
 
   test('nothing that changes the world is retried', () => {
-    for (const name of ['voice.calls.place', 'conversations.post_message', 'channels.linkedin_publish', 'agent.turn', 'customers.update', 'voice.jobs.create', 'mcp'] as RouteName[]) {
+    for (const name of ['voice.calls.place', 'conversations.post_message', 'channels.linkedin_publish', 'agent.turn', 'customers.update', 'voice.jobs.create', 'mcp', 'knowledge.documents.create', 'knowledge.documents.update', 'knowledge.documents.delete', 'knowledge.import_file', 'knowledge.sources.create', 'knowledge.sources.crawl'] as RouteName[]) {
       expect(RETRYABLE.has(name)).toBe(false)
     }
   })
@@ -240,6 +250,52 @@ describe('server helpers', () => {
     expect((await post({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, 'wrong')).status).toBe(401)
     expect((await post({ jsonrpc: '2.0', method: 'notifications/initialized' })).status).toBe(202)
     expect((await serveMcp(new Request('https://desk.test/health'), 'tok', reg, () => ({ who: '' }))).status).toBe(200)
+  })
+})
+
+describe('knowledge documents', () => {
+  test('a document is created in the default app and comes back with its index status', async () => {
+    const doc = { id: '01A', title: 'Hours', index: { status: 'queued', chunks: 0, tokens: 0, indexed_at: null }, version: 0 }
+    const { fetcher, seen } = mock(ok(doc))
+    const out = await client(fetcher, { app: 'desk' }).knowledge.documents.create({ title: 'Hours', content: '9 to 5' })
+    expect(out.index.status).toBe('queued')
+    expect(seen[0]!.method).toBe('POST')
+    expect(new URL(seen[0]!.url).pathname).toBe('/core/knowledge/documents')
+    expect(JSON.parse(seen[0]!.body)).toEqual({ title: 'Hours', content: '9 to 5', app: 'desk' })
+  })
+
+  test('a file is sent as the raw body with its name and type', async () => {
+    const { fetcher, seen } = mock(ok({ id: '01F' }))
+    await client(fetcher).knowledge.importFile(new Uint8Array([37, 80, 68, 70]), { filename: 'hand book.pdf', contentType: 'application/pdf' })
+    const url = new URL(seen[0]!.url)
+    expect(url.pathname).toBe('/core/knowledge/import')
+    expect(url.searchParams.get('filename')).toBe('hand book.pdf')
+    expect(seen[0]!.headers.get('content-type')).toBe('application/pdf')
+    expect(seen[0]!.body).toBe('<binary>')
+  })
+
+  test('an export sends since even when it is 0, and the cursor of the page before', async () => {
+    const { fetcher, seen } = mock(ok({ version: 12, documents: [], deleted: [], resync: false, next_cursor: '' }))
+    const o = client(fetcher)
+    const first = await o.knowledge.export()
+    expect(first.version).toBe(12)
+    expect(new URL(seen[0]!.url).search).toBe('')
+    await o.knowledge.export({ since: 0, cursor: '12.4.01A', limit: 20 })
+    const q = new URL(seen[1]!.url).searchParams
+    expect([q.get('since'), q.get('cursor'), q.get('limit')]).toEqual(['0', '12.4.01A', '20'])
+  })
+
+  test('a write that is refused is not sent again', async () => {
+    const { fetcher, seen } = mock(fail(503, 'UPSTREAM_UNAVAILABLE', 'try later'))
+    await expect(client(fetcher).knowledge.documents.delete('01A')).rejects.toBeInstanceOf(OmazyError)
+    expect(seen.length).toBe(1)
+  })
+
+  test('a rate-limited read is sent again', async () => {
+    const { fetcher, seen } = mock(fail(429, 'RATE_LIMITED', 'slow down', { 'retry-after': '0' }), ok({ documents: [], next_cursor: '', version: 3 }))
+    const page = await client(fetcher).knowledge.documents.list({ limit: 10 })
+    expect(page.version).toBe(3)
+    expect(seen.length).toBe(2)
   })
 })
 

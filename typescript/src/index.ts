@@ -11,7 +11,12 @@ import type {
   CallStatus,
   CompleteRequest,
   CompleteResult,
+  DocumentInput,
+  DocumentPage,
+  DocumentPatch,
   Json,
+  KnowledgeDocument,
+  KnowledgeExport,
   KnowledgePassage,
   StreamEvent,
   VoiceJobRequest,
@@ -25,7 +30,7 @@ export { readSse, type SseFrame } from './sse.js'
 export type * from './types.js'
 
 export const DEFAULT_BASE_URL = 'https://mw.omazy.ai/api/v1/core'
-export const VERSION = '0.1.0'
+export const VERSION = '0.2.0'
 
 export interface OmazyOptions {
   /** An install token, `cai_<prefix>.<secret>`. Server side only. */
@@ -118,6 +123,76 @@ export class Omazy {
     search: async (query: string, opts: { top_k?: number; language?: string; app?: string } = {}) =>
       (await this.json<{ passages: KnowledgePassage[] }>('knowledge.search', { json: this.withApp({ query, ...opts }) }))
         .passages ?? [],
+
+    documents: {
+      /** One page of the knowledge base, newest first, without content. Needs `kb:read`. */
+      list: (opts: { cursor?: string; limit?: number; app?: string } = {}) =>
+        this.json<DocumentPage>('knowledge.documents.list', {
+          query: { cursor: opts.cursor, limit: opts.limit ? String(opts.limit) : undefined, app: opts.app ?? this.app },
+        }),
+      /** One document with its content and how its indexing stands. Needs `kb:read`. */
+      get: (id: string, opts: { app?: string } = {}) =>
+        this.json<KnowledgeDocument>('knowledge.documents.get', { path: { id }, query: { app: opts.app ?? this.app } }),
+      /**
+       * Add a document. It is indexed in the background: read it again, or wait
+       * for `kb.updated`, to see `index.status` reach `ready`. Sending a document
+       * that already exists in every field returns the existing one. Never
+       * retried by the client. Needs `kb:write`.
+       */
+      create: (doc: DocumentInput) =>
+        this.json<KnowledgeDocument>('knowledge.documents.create', { json: this.withApp(doc) }),
+      /** Change the fields given and index the document again. Needs `kb:write`. */
+      update: (id: string, patch: DocumentPatch) =>
+        this.json<KnowledgeDocument>('knowledge.documents.update', { path: { id }, json: this.withApp(patch) }),
+      /** Delete a document. The agent stops using it. Needs `kb:write`. */
+      delete: (id: string, opts: { app?: string } = {}) =>
+        this.json<{ id: string; deleted: boolean }>('knowledge.documents.delete', {
+          path: { id },
+          query: { app: opts.app ?? this.app },
+        }),
+    },
+
+    /**
+     * Turn a file into a document: PDF, spreadsheet, image or text, at most
+     * 20 MB. `file` is the raw bytes. Needs `kb:write`.
+     */
+    importFile: (file: BodyInit, opts: { filename: string; contentType?: string; app?: string }) =>
+      this.json<KnowledgeDocument>('knowledge.import_file', {
+        body: file,
+        query: { filename: opts.filename, app: opts.app ?? this.app },
+        headers: { 'content-type': opts.contentType ?? 'application/octet-stream' },
+      }),
+
+    sources: {
+      /** The websites the knowledge base is crawled from. Needs `kb:read`. */
+      list: async (opts: { app?: string } = {}) =>
+        (await this.json<{ sources: Json[] }>('knowledge.sources.list', { query: { app: opts.app ?? this.app } })).sources ?? [],
+      /** Add a website and start crawling it. Each page becomes a document. Needs `kb:write`. */
+      create: (req: { root_url: string; max_pages?: number; max_depth?: number; app?: string }) =>
+        this.json<Json>('knowledge.sources.create', { json: this.withApp(req) }),
+      /** Crawl a source again. Needs `kb:write`. */
+      crawl: (id: string, opts: { app?: string } = {}) =>
+        this.json<{ id: string; queued: boolean }>('knowledge.sources.crawl', {
+          path: { id },
+          query: { app: opts.app ?? this.app },
+        }),
+    },
+
+    /**
+     * What changed in the knowledge base after `since`, with the passages
+     * search uses, for keeping your own copy. Without `since` it returns
+     * everything indexed. Follow `next_cursor` until it is empty, then keep
+     * `version` for the next call. Needs `kb:read`.
+     */
+    export: (opts: { since?: number; cursor?: string; limit?: number; app?: string } = {}) =>
+      this.json<KnowledgeExport>('knowledge.export', {
+        query: {
+          since: opts.since !== undefined ? String(opts.since) : undefined,
+          cursor: opts.cursor,
+          limit: opts.limit ? String(opts.limit) : undefined,
+          app: opts.app ?? this.app,
+        },
+      }),
   }
 
   readonly agent = {

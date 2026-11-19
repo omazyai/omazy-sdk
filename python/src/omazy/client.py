@@ -13,7 +13,7 @@ from .errors import OmazyError
 from .routes import RETRYABLE, ROUTES
 
 DEFAULT_BASE_URL = "https://mw.omazy.ai/api/v1/core"
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 Json = Dict[str, Any]
 
@@ -261,11 +261,93 @@ class _AI:
 class _Knowledge:
     def __init__(self, c: Omazy) -> None:
         self._c = c
+        self.documents = _Documents(c)
+        self.sources = _Sources(c)
 
     def search(self, query: str, top_k: Optional[int] = None, language: Optional[str] = None, app: Optional[str] = None) -> List[Json]:
         """Passages from the agent's knowledge base. Needs ``kb:search``."""
         body = self._c._with_app({"query": query, "top_k": top_k, "language": language}, app)
         return (self._c._json("knowledge.search", body=body) or {}).get("passages") or []
+
+    def import_file(self, file: bytes, filename: str, content_type: str = "application/octet-stream", app: Optional[str] = None) -> Json:
+        """Turn a file into a document: PDF, spreadsheet, image or text, at most 20 MB. Needs ``kb:write``."""
+        return self._c._json(
+            "knowledge.import_file",
+            raw=file,
+            query={"filename": filename, "app": app or self._c._app},
+            headers={"Content-Type": content_type},
+        )
+
+    def export(self, since: Optional[int] = None, cursor: Optional[str] = None, limit: Optional[int] = None, app: Optional[str] = None) -> Json:
+        """What changed in the knowledge base after ``since``, with the passages search uses.
+
+        For keeping your own copy. Without ``since`` it returns everything
+        indexed. Follow ``next_cursor`` until it is empty, then keep
+        ``version`` for the next call. Needs ``kb:read``.
+        """
+        return self._c._json(
+            "knowledge.export",
+            query={
+                "since": None if since is None else str(since),
+                "cursor": cursor,
+                "limit": None if limit is None else str(limit),
+                "app": app or self._c._app,
+            },
+        )
+
+
+class _Documents:
+    def __init__(self, c: Omazy) -> None:
+        self._c = c
+
+    def list(self, cursor: Optional[str] = None, limit: Optional[int] = None, app: Optional[str] = None) -> Json:
+        """One page of the knowledge base, newest first, without content. Needs ``kb:read``."""
+        return self._c._json(
+            "knowledge.documents.list",
+            query={"cursor": cursor, "limit": None if limit is None else str(limit), "app": app or self._c._app},
+        )
+
+    def get(self, document_id: str, app: Optional[str] = None) -> Json:
+        """One document with its content and how its indexing stands. Needs ``kb:read``."""
+        return self._c._json("knowledge.documents.get", path={"id": document_id}, query={"app": app or self._c._app})
+
+    def create(self, title: str, content: Optional[str] = None, app: Optional[str] = None, **fields: Any) -> Json:
+        """Add a document. It is indexed in the background.
+
+        Read it again, or wait for ``kb.updated``, to see ``index.status``
+        reach ``ready``. Other fields: ``kind``, ``source_url``, ``data``,
+        ``language``, ``is_active``. Sending a document that already exists in
+        every field returns the existing one. Never retried by the client.
+        Needs ``kb:write``.
+        """
+        body = self._c._with_app({"title": title, "content": content, **fields}, app)
+        return self._c._json("knowledge.documents.create", body=body)
+
+    def update(self, document_id: str, app: Optional[str] = None, **fields: Any) -> Json:
+        """Change the fields given and index the document again. Needs ``kb:write``."""
+        return self._c._json("knowledge.documents.update", path={"id": document_id}, body=self._c._with_app(fields, app))
+
+    def delete(self, document_id: str, app: Optional[str] = None) -> Json:
+        """Delete a document. The agent stops using it. Needs ``kb:write``."""
+        return self._c._json("knowledge.documents.delete", path={"id": document_id}, query={"app": app or self._c._app})
+
+
+class _Sources:
+    def __init__(self, c: Omazy) -> None:
+        self._c = c
+
+    def list(self, app: Optional[str] = None) -> List[Json]:
+        """The websites the knowledge base is crawled from. Needs ``kb:read``."""
+        return (self._c._json("knowledge.sources.list", query={"app": app or self._c._app}) or {}).get("sources") or []
+
+    def create(self, root_url: str, max_pages: Optional[int] = None, max_depth: Optional[int] = None, app: Optional[str] = None) -> Json:
+        """Add a website and start crawling it. Each page becomes a document. Needs ``kb:write``."""
+        body = self._c._with_app({"root_url": root_url, "max_pages": max_pages, "max_depth": max_depth}, app)
+        return self._c._json("knowledge.sources.create", body=body)
+
+    def crawl(self, source_id: str, app: Optional[str] = None) -> Json:
+        """Crawl a source again. Needs ``kb:write``."""
+        return self._c._json("knowledge.sources.crawl", path={"id": source_id}, query={"app": app or self._c._app})
 
 
 class _Agent:

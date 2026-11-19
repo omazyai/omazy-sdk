@@ -5,7 +5,7 @@ Go client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/). S
 ## Install
 
 ```sh
-go get github.com/omazyai/omazy-sdk/go@v0.1.0
+go get github.com/omazyai/omazy-sdk/go@v0.2.0
 ```
 
 ```go
@@ -38,6 +38,8 @@ The token is a Core API token (`cai_...`). A workspace owner creates it and choo
 | `c.Whoami` | none |
 | `c.AI.Complete`, `c.AI.Stream` | `ai:complete` |
 | `c.Knowledge.Search` | `kb:search` |
+| `c.Knowledge.ListDocuments`, `GetDocument`, `ListSources`, `Export` | `kb:read` |
+| `c.Knowledge.CreateDocument`, `UpdateDocument`, `DeleteDocument`, `ImportFile`, `CreateSource`, `CrawlSource` | `kb:write` |
 | `c.Agent.Turn` | `agent:run` |
 | `c.Voice.Speak`, `c.Voice.Transcribe` | `voice:speech` |
 | `c.Voice.PlaceCall`, `c.Voice.GetCall` | `voice:calls` |

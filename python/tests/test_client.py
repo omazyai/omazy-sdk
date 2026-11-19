@@ -108,6 +108,16 @@ class ContractTest(Base):
         o.whoami()
         o.ai.complete([{"role": "user", "content": "hi"}])
         o.knowledge.search("q")
+        o.knowledge.documents.list()
+        o.knowledge.documents.create("t", "c")
+        o.knowledge.documents.get("c1")
+        o.knowledge.documents.update("c1", title="t2")
+        o.knowledge.documents.delete("c1")
+        o.knowledge.import_file(b"\x01\x02", "a.pdf")
+        o.knowledge.sources.list()
+        o.knowledge.sources.create("https://x.test")
+        o.knowledge.sources.crawl("c1")
+        o.knowledge.export()
         o.agent.turn("hi")
         o.voice.speak("hi")
         o.voice.transcribe(b"\x01\x02")
@@ -132,8 +142,56 @@ class ContractTest(Base):
             self.assertIn((method, path), used, f"{name} was never called")
 
     def test_nothing_that_changes_the_world_is_retried(self):
-        for name in ("voice.calls.place", "conversations.post_message", "channels.linkedin_publish", "agent.turn", "customers.update", "voice.jobs.create", "mcp"):
+        for name in (
+            "voice.calls.place", "conversations.post_message", "channels.linkedin_publish", "agent.turn", "customers.update",
+            "voice.jobs.create", "mcp", "knowledge.documents.create", "knowledge.documents.update", "knowledge.documents.delete",
+            "knowledge.import_file", "knowledge.sources.create", "knowledge.sources.crawl",
+        ):
             self.assertNotIn(name, RETRYABLE)
+
+
+class KnowledgeTest(Base):
+    def test_a_document_is_created_in_the_default_app_and_none_fields_are_left_out(self):
+        self.api.answers = [ok({"id": "01A", "index": {"status": "queued"}})]
+        doc = self.client(app="desk").knowledge.documents.create("Hours", "9 to 5", language="en", source_url=None)
+        self.assertEqual(doc["index"]["status"], "queued")
+        seen = self.api.seen[0]
+        self.assertEqual((seen["method"], seen["path"]), ("POST", "/core/knowledge/documents"))
+        self.assertEqual(json.loads(seen["body"]), {"title": "Hours", "content": "9 to 5", "language": "en", "app": "desk"})
+
+    def test_a_patch_can_switch_a_document_off(self):
+        self.api.answers = [ok({"id": "01A", "is_active": False})]
+        self.client().knowledge.documents.update("01A", is_active=False)
+        seen = self.api.seen[0]
+        self.assertEqual((seen["method"], seen["path"]), ("PATCH", "/core/knowledge/documents/01A"))
+        self.assertEqual(json.loads(seen["body"]), {"is_active": False})
+
+    def test_a_file_is_sent_as_the_raw_body_with_its_name_and_type(self):
+        self.api.answers = [ok({"id": "01F"})]
+        self.client().knowledge.import_file(b"%PDF-1.7", "hand book.pdf", content_type="application/pdf")
+        seen = self.api.seen[0]
+        self.assertEqual(seen["path"], "/core/knowledge/import?filename=hand+book.pdf")
+        self.assertEqual(seen["headers"]["Content-Type"], "application/pdf")
+        self.assertEqual(seen["body"], b"%PDF-1.7")
+
+    def test_an_export_sends_since_even_when_it_is_0(self):
+        self.api.answers = [ok({"version": 12, "documents": [], "deleted": [], "resync": False, "next_cursor": ""})]
+        o = self.client()
+        self.assertEqual(o.knowledge.export()["version"], 12)
+        self.assertEqual(self.api.seen[0]["path"], "/core/knowledge/export")
+        o.knowledge.export(since=0, cursor="12.4.01A", limit=20)
+        self.assertEqual(self.api.seen[1]["path"], "/core/knowledge/export?since=0&cursor=12.4.01A&limit=20")
+
+    def test_a_write_that_is_refused_is_not_sent_again(self):
+        self.api.answers = [fail(503, "UPSTREAM_UNAVAILABLE", "try later")]
+        with self.assertRaises(OmazyError):
+            self.client().knowledge.documents.delete("01A")
+        self.assertEqual(len(self.api.seen), 1)
+
+    def test_a_rate_limited_read_is_sent_again(self):
+        self.api.answers = [fail(429, "RATE_LIMITED", "slow down", **{"Retry-After": "1"}), ok({"documents": [], "next_cursor": "", "version": 3})]
+        self.assertEqual(self.client().knowledge.documents.list(limit=10)["version"], 3)
+        self.assertEqual(len(self.api.seen), 2)
 
 
 class RequestTest(Base):

@@ -53,6 +53,104 @@ export interface CompleteResult {
 
 export type StreamEvent = { type: 'delta'; text: string } | { type: 'done'; result: CompleteResult }
 
+/** How indexing of a document stands. */
+export interface KnowledgeIndex {
+  status: 'queued' | 'indexing' | 'ready' | 'failed'
+  /** Why the last pass failed. Indexing is tried again on its own. */
+  error?: string
+  indexed_at: string | null
+  chunks: number
+  tokens: number
+}
+
+export type DocumentKind = 'text' | 'faq' | 'structured' | 'pricing' | 'catalog'
+
+/** One document of the agent's knowledge base. */
+export interface KnowledgeDocument {
+  id: string
+  kind: DocumentKind
+  title: string
+  source_url: string | null
+  language: string
+  is_active: boolean
+  /** Left out of a list. */
+  content?: string
+  data?: Json
+  index: KnowledgeIndex
+  /** The knowledge version of the document's last index. */
+  version: number
+  created_at: string
+  updated_at: string
+}
+
+export interface DocumentInput {
+  /** App handle. Needed only when the workspace has more than one app. */
+  app?: string
+  title: string
+  content?: string
+  /** `text` when left out. */
+  kind?: DocumentKind
+  source_url?: string
+  /** Structured fields, for the structured, pricing and catalog kinds. */
+  data?: Json
+  language?: string
+  is_active?: boolean
+}
+
+/** Fields left out are kept. */
+export type DocumentPatch = Partial<DocumentInput>
+
+export interface DocumentPage {
+  documents: KnowledgeDocument[]
+  /** Empty on the last page. */
+  next_cursor: string
+  /** The agent's knowledge version now. */
+  version: number
+}
+
+export interface ExportedDocument {
+  id: string
+  kind: DocumentKind
+  title: string
+  source_url: string | null
+  language: string
+  /** False for a document that was switched off: drop it from your copy. */
+  is_active: boolean
+  version: number
+  updated_at: string
+  /** The passages search uses, in order. */
+  chunks: { ordinal: number; text: string; tokens: number; checksum: string }[]
+}
+
+export interface KnowledgeExport {
+  /** What this export is complete up to. Pass it as `since` next time. */
+  version: number
+  documents: ExportedDocument[]
+  /** Documents that no longer exist. Sent with the first page when `since` was given. */
+  deleted: { id: string; version: number }[]
+  /** True when too much was deleted to list: drop your copy and export again without `since`. */
+  resync: boolean
+  /** Empty on the last page. */
+  next_cursor: string
+}
+
+/** The body of a `kb.updated` event sent to your events URL. */
+export interface KnowledgeUpdatedEvent {
+  id: string
+  event: 'kb.updated'
+  workspace_id: string
+  sent_at: string
+  data: {
+    document_id: string
+    app: string
+    op: 'indexed' | 'failed' | 'deleted'
+    status: 'ready' | 'failed' | 'deleted'
+    version: number
+    is_active?: boolean
+    error?: string
+  }
+}
+
 export interface KnowledgePassage {
   document_id: string
   title: string
@@ -141,7 +239,7 @@ export interface CallStatus {
 
 export interface VoiceJobRequest {
   app?: string
-  kind: 'transcribe' | 'notes' | (string & {})
+  kind: 'transcribe' | 'meeting_notes' | (string & {})
   source_url?: string
   source_call_id?: string
   lang?: string[]

@@ -31,7 +31,7 @@ const (
 	// DefaultBaseURL is the production Core API.
 	DefaultBaseURL = "https://mw.omazy.ai/api/v1/core"
 	// Version of this client.
-	Version = "0.1.0"
+	Version = "0.2.0"
 )
 
 // Error is a refusal or failure from the Core API. Branch on Code, log Message.
@@ -435,7 +435,8 @@ func readSSE(r io.Reader, fn func(event, data string) (done bool, err error)) er
 	return err
 }
 
-// KnowledgeService searches the agent's knowledge base.
+// KnowledgeService searches the agent's knowledge base, and reads and writes
+// what is in it.
 type KnowledgeService struct{ c *Client }
 
 // Search returns the best matching passages. Needs kb:search.
@@ -454,6 +455,100 @@ func (s *KnowledgeService) Search(ctx context.Context, query string, opts Search
 		Passages []Passage `json:"passages"`
 	}
 	return out.Passages, s.c.json(ctx, "knowledge.search", call{body: body}, &out)
+}
+
+func itoa(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strconv.Itoa(n)
+}
+
+// ListDocuments returns one page of the knowledge base, newest first, without
+// content. Needs kb:read.
+func (s *KnowledgeService) ListDocuments(ctx context.Context, opts ListOptions) (*DocumentPage, error) {
+	var out DocumentPage
+	return &out, s.c.json(ctx, "knowledge.documents.list", call{
+		query: map[string]string{"cursor": opts.Cursor, "limit": itoa(opts.Limit), "app": s.c.appOr(opts.App)},
+	}, &out)
+}
+
+// GetDocument reads one document with its content and how its indexing stands.
+// Needs kb:read.
+func (s *KnowledgeService) GetDocument(ctx context.Context, id, app string) (*Document, error) {
+	var out Document
+	return &out, s.c.json(ctx, "knowledge.documents.get", call{path: map[string]string{"id": id}, query: map[string]string{"app": s.c.appOr(app)}}, &out)
+}
+
+// CreateDocument adds a document. It is indexed in the background: read it
+// again, or wait for kb.updated, to see Index.Status reach ready. Sending a
+// document that already exists in every field returns the existing one. Never
+// retried by the client. Needs kb:write.
+func (s *KnowledgeService) CreateDocument(ctx context.Context, in DocumentInput) (*Document, error) {
+	in.App = s.c.appOr(in.App)
+	var out Document
+	return &out, s.c.json(ctx, "knowledge.documents.create", call{body: in}, &out)
+}
+
+// UpdateDocument changes the fields given and indexes the document again.
+// Needs kb:write.
+func (s *KnowledgeService) UpdateDocument(ctx context.Context, id string, patch DocumentPatch) (*Document, error) {
+	patch.App = s.c.appOr(patch.App)
+	var out Document
+	return &out, s.c.json(ctx, "knowledge.documents.update", call{path: map[string]string{"id": id}, body: patch}, &out)
+}
+
+// DeleteDocument deletes a document. The agent stops using it. Needs kb:write.
+func (s *KnowledgeService) DeleteDocument(ctx context.Context, id, app string) error {
+	return s.c.json(ctx, "knowledge.documents.delete", call{path: map[string]string{"id": id}, query: map[string]string{"app": s.c.appOr(app)}}, nil)
+}
+
+// ImportFile turns a file into a document: PDF, spreadsheet, image or text, at
+// most 20 MB. contentType may be empty. Needs kb:write.
+func (s *KnowledgeService) ImportFile(ctx context.Context, file []byte, filename, contentType, app string) (*Document, error) {
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	var out Document
+	return &out, s.c.json(ctx, "knowledge.import_file", call{
+		raw:     file,
+		query:   map[string]string{"filename": filename, "app": s.c.appOr(app)},
+		headers: map[string]string{"Content-Type": contentType},
+	}, &out)
+}
+
+// ListSources returns the websites the knowledge base is crawled from. Needs
+// kb:read.
+func (s *KnowledgeService) ListSources(ctx context.Context, app string) ([]map[string]any, error) {
+	var out struct {
+		Sources []map[string]any `json:"sources"`
+	}
+	return out.Sources, s.c.json(ctx, "knowledge.sources.list", call{query: map[string]string{"app": s.c.appOr(app)}}, &out)
+}
+
+// CreateSource adds a website and starts crawling it. Each page becomes a
+// document. Needs kb:write.
+func (s *KnowledgeService) CreateSource(ctx context.Context, in SourceInput) (map[string]any, error) {
+	in.App = s.c.appOr(in.App)
+	var out map[string]any
+	return out, s.c.json(ctx, "knowledge.sources.create", call{body: in}, &out)
+}
+
+// CrawlSource crawls a source again. Needs kb:write.
+func (s *KnowledgeService) CrawlSource(ctx context.Context, id, app string) error {
+	return s.c.json(ctx, "knowledge.sources.crawl", call{path: map[string]string{"id": id}, query: map[string]string{"app": s.c.appOr(app)}}, nil)
+}
+
+// Export returns what changed in the knowledge base after opts.Since, with the
+// passages search uses, for keeping your own copy. Follow NextCursor until it
+// is empty, then keep Version for the next call. Needs kb:read.
+func (s *KnowledgeService) Export(ctx context.Context, opts ExportOptions) (*KnowledgeExport, error) {
+	q := map[string]string{"cursor": opts.Cursor, "limit": itoa(opts.Limit), "app": s.c.appOr(opts.App)}
+	if opts.Since != nil {
+		q["since"] = strconv.FormatInt(*opts.Since, 10)
+	}
+	var out KnowledgeExport
+	return &out, s.c.json(ctx, "knowledge.export", call{query: q}, &out)
 }
 
 // AgentService runs the workspace's own agent.

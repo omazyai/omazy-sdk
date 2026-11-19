@@ -5,7 +5,7 @@ Python client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/
 ## Install
 
 ```sh
-pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.1.0/omazy-0.1.0-py3-none-any.whl
+pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.2.0/omazy-0.2.0-py3-none-any.whl
 ```
 
 ## Use
@@ -34,6 +34,8 @@ The token is a Core API token (`cai_...`). A workspace owner creates it and choo
 | `whoami()` | none |
 | `ai.complete(messages, **options)`, `ai.stream(messages, **options)` | `ai:complete` |
 | `knowledge.search(query, top_k=, language=)` | `kb:search` |
+| `knowledge.documents.list()`, `knowledge.documents.get(document_id)`, `knowledge.sources.list()`, `knowledge.export(since=, cursor=)` | `kb:read` |
+| `knowledge.documents.create(title, content)`, `.update(document_id, **fields)`, `.delete(document_id)`, `knowledge.import_file(file, filename)`, `knowledge.sources.create(root_url)`, `.crawl(source_id)` | `kb:write` |
 | `agent.turn(message, history=, session_id=)` | `agent:run` |
 | `voice.speak(text)`, `voice.transcribe(audio)` | `voice:speech` |
 | `voice.calls.place(to, purpose, consent_basis)`, `voice.calls.get(ref)` | `voice:calls` |
@@ -44,6 +46,33 @@ The token is a Core API token (`cai_...`). A workspace owner creates it and choo
 | `channels.linkedin_publish(text)` | `channels:publish` |
 | `sessions.bind_credential(...)`, `sessions.unbind_credential(...)` | `sessions:credentials` |
 | `mcp.list_tools()`, `mcp.call_tool(name, arguments)`, `mcp.config()` | the tool's own scope |
+
+## Writing knowledge
+
+A document is indexed in the background. `index["status"]` goes from `queued` to `ready`, or to `failed` with a reason.
+
+```python
+doc = omazy.knowledge.documents.create("Opening hours", "Open 9 to 5, Sunday to Thursday.")
+omazy.knowledge.import_file(pdf_bytes, "handbook.pdf", content_type="application/pdf")
+
+status = omazy.knowledge.documents.get(doc["id"])["index"]["status"]
+```
+
+To keep your own copy of the knowledge base, export everything once, then only what changed:
+
+```python
+cursor = None
+while True:
+    page = omazy.knowledge.export(since=saved, cursor=cursor)  # saved is None the first time
+    for d in page["documents"]:
+        store(d) if d["is_active"] else drop(d["id"])
+    for d in page["deleted"]:
+        drop(d["id"])
+    cursor = page["next_cursor"]
+    if not cursor:
+        saved = page["version"]
+        break
+```
 
 ## Streaming
 
