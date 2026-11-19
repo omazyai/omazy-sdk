@@ -1,0 +1,108 @@
+# Publishes the clients to the public registries. Run by hand for a tag that
+# already exists (Actions, "Publish", Run workflow).
+#
+# One-time setup by the account owner:
+#   npm   create the organisation "omazyai" on npmjs.com, then add an
+#         automation token as the repository secret NPM_TOKEN.
+#   PyPI  add this repository and this workflow file as a trusted publisher
+#         for the project "omazy" (pypi.org, Publishing, pending publisher).
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish, such as v0.1.0
+        required: true
+      npm:
+        description: Publish to npmjs.com
+        type: boolean
+        default: true
+      pypi:
+        description: Publish to PyPI
+        type: boolean
+        default: true
+      github_packages:
+        description: Publish to GitHub Packages
+        type: boolean
+        default: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: npm ci && npm run check
+        working-directory: typescript
+      - run: python3 -m unittest discover -s tests
+        working-directory: python
+      - run: go test ./...
+        working-directory: go
+
+  npm:
+    if: ${{ inputs.npm }}
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci && npm publish --access public
+        working-directory: typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-packages:
+    if: ${{ inputs.github_packages }}
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://npm.pkg.github.com
+      - run: npm ci && npm publish
+        working-directory: typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  pypi:
+    if: ${{ inputs.pypi }}
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3 -m pip install build && python3 -m build
+        working-directory: python
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: python/dist

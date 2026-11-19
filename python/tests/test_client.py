@@ -1,0 +1,264 @@
+import json
+import pathlib
+import sys
+import threading
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
+
+from omazy import RETRYABLE, ROUTES, Omazy, OmazyError, sign, verify_signature  # noqa: E402
+
+# hmac-sha256('s3cret', '{"a":1}') in hex, computed with openssl. The three SDKs
+# test against the same vector.
+SIG_VECTOR = "5910e62016ef5034272c926c27071992a465c2335cecf41851bda071577f4f6d"
+# The contract sits beside the SDKs: two levels up in the public repository,
+# three in the platform's own.
+CONTRACT = next(
+    p
+    for p in (
+        pathlib.Path(__file__).resolve().parents[n] / "contracts" / "core-api.routes.json" for n in (2, 3)
+    )
+    if p.exists()
+)
+
+
+class FakeAPI:
+    """A real HTTP server on a free port that answers from a queue."""
+
+    def __init__(self):
+        self.seen = []
+        self.answers = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _handle(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b""
+                outer.seen.append({"method": self.command, "path": self.path, "headers": dict(self.headers), "body": body})
+                answer = outer.answers.pop(0) if len(outer.answers) > 1 else outer.answers[0]
+                if callable(answer):
+                    answer = answer(self.path)
+                status, headers, payload = answer
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                if isinstance(payload, list):  # a stream: chunks, then close
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    for chunk in payload:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    self.close_connection = True
+                    return
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = do_POST = do_PATCH = do_PUT = do_DELETE = _handle
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}/core"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def ok(data, **headers):
+    return 200, {"Content-Type": "application/json", **headers}, json.dumps({"success": True, "data": data}).encode()
+
+
+def fail(status, code, message, **headers):
+    return status, headers, json.dumps({"success": False, "error": {"code": code, "message": message}}).encode()
+
+
+def rpc(result=None, error=None):
+    body = {"jsonrpc": "2.0", "id": 1}
+    body.update({"error": error} if error else {"result": result})
+    return 200, {}, json.dumps(body).encode()
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.api = FakeAPI()
+        self.addCleanup(self.api.close)
+        self.slept = []
+
+    def client(self, **kw):
+        return Omazy("cai_abc.def", base_url=self.api.base, sleep=self.slept.append, **kw)
+
+
+class ContractTest(Base):
+    def test_route_table_is_the_contract(self):
+        contract = json.loads(CONTRACT.read_text())["routes"]
+        want = {r["sdk"]: (r["method"], r["path"]) for r in contract}
+        self.assertEqual(ROUTES, want)
+
+    def test_every_route_is_reachable_through_a_client_method(self):
+        self.api.answers = [lambda path: rpc({"tools": []}) if path.endswith("/mcp") else ok({"passages": []})]
+        o = self.client()
+        o.whoami()
+        o.ai.complete([{"role": "user", "content": "hi"}])
+        o.knowledge.search("q")
+        o.agent.turn("hi")
+        o.voice.speak("hi")
+        o.voice.transcribe(b"\x01\x02")
+        o.voice.calls.place("+8801712345678", "reminder", "customer")
+        o.voice.calls.get("r1")
+        o.voice.jobs.create("transcribe", source_url="https://x.test/a.mp3")
+        o.voice.jobs.get("j1")
+        o.customers.get("c1")
+        o.customers.update("c1", {"tier": "gold"})
+        o.conversations.post_message("s1", [{"type": "text", "markdown": "hi"}])
+        o.channels.linkedin_publish("hi")
+        o.sessions.bind_credential("s1", "erp", "t", "2027-01-01T00:00:00Z", {})
+        o.sessions.unbind_credential("s1", "erp")
+        o.mcp.list_tools()
+
+        used = {(s["method"], s["path"].split("?")[0].replace("/core", "", 1)) for s in self.api.seen}
+        fill = {"{ref}": "r1", "{sid}": "s1", "{server}": "erp"}
+        for name, (method, path) in ROUTES.items():
+            for k, v in fill.items():
+                path = path.replace(k, v)
+            path = path.replace("{id}", "j1" if name.startswith("voice.jobs") else "s1" if name.startswith("conv") else "c1")
+            self.assertIn((method, path), used, f"{name} was never called")
+
+    def test_nothing_that_changes_the_world_is_retried(self):
+        for name in ("voice.calls.place", "conversations.post_message", "channels.linkedin_publish", "agent.turn", "customers.update", "voice.jobs.create", "mcp"):
+            self.assertNotIn(name, RETRYABLE)
+
+
+class RequestTest(Base):
+    def test_token_envelope_and_default_app(self):
+        self.api.answers = [ok({"text": "pong", "stop_reason": "stop", "model": "openai/gpt-4o", "usage": {}})]
+        res = self.client(app="kiosk").ai.complete([{"role": "user", "content": "ping"}], max_tokens=8)
+        self.assertEqual(res["text"], "pong")
+        seen = self.api.seen[0]
+        self.assertEqual(seen["headers"]["Authorization"], "Bearer cai_abc.def")
+        self.assertEqual(json.loads(seen["body"]), {"messages": [{"role": "user", "content": "ping"}], "max_tokens": 8, "stream": False, "app": "kiosk"})
+
+    def test_path_arguments_are_escaped_into_one_segment(self):
+        self.api.answers = [ok({})]
+        self.client().voice.calls.get("a/../b", app="kiosk")
+        self.assertEqual(self.api.seen[0]["path"], "/core/voice/calls/a%2F..%2Fb?app=kiosk")
+
+    def test_a_refusal_becomes_an_error_with_code_status_and_request_id(self):
+        self.api.answers = [fail(403, "FORBIDDEN", "missing scope: ai:complete", **{"X-Request-Id": "req_1"})]
+        with self.assertRaises(OmazyError) as cm:
+            self.client().ai.complete([{"role": "user", "content": "x"}])
+        e = cm.exception
+        self.assertEqual((e.status, e.code, e.message, e.request_id), (403, "FORBIDDEN", "missing scope: ai:complete", "req_1"))
+
+    def test_response_headers_are_read_into_last(self):
+        self.api.answers = [ok({}, **{"X-Request-Id": "req_9", "X-RateLimit-Limit": "600", "X-RateLimit-Remaining": "12", "X-RateLimit-Reset": "3", "X-Omazy-Token-Use": "previous", "X-Omazy-Token-Expires-At": "2026-12-01T00:00:00Z"})]
+        o = self.client()
+        o.whoami()
+        self.assertEqual((o.last.request_id, o.last.rate_limit, o.last.rate_remaining, o.last.rate_reset_seconds), ("req_9", 600, 12, 3))
+        self.assertTrue(o.last.token_is_previous)
+        self.assertEqual(o.last.token_expires_at, "2026-12-01T00:00:00Z")
+
+    def test_speak_returns_audio_and_language(self):
+        self.api.answers = [(200, {"Content-Type": "audio/wav", "X-Omazy-Speech-Lang": "bn"}, b"RIFFdata")]
+        audio, lang = self.client().voice.speak("hello")
+        self.assertEqual((audio, lang), (b"RIFFdata", "bn"))
+
+
+class RetryTest(Base):
+    def test_a_rate_limited_read_is_sent_again_after_retry_after(self):
+        self.api.answers = [fail(429, "RATE_LIMIT_EXCEEDED", "slow down", **{"Retry-After": "2"}), fail(503, "UPSTREAM_UNAVAILABLE", "busy"), ok({"passages": [{"title": "t"}]})]
+        self.assertEqual(len(self.client().knowledge.search("q")), 1)
+        self.assertEqual(len(self.api.seen), 3)
+        self.assertEqual(self.slept[0], 2)
+
+    def test_placing_a_call_is_never_sent_twice(self):
+        self.api.answers = [fail(503, "UPSTREAM_UNAVAILABLE", "busy")]
+        with self.assertRaises(OmazyError):
+            self.client().voice.calls.place("+8801712345678", "reminder", "customer")
+        self.assertEqual(len(self.api.seen), 1)
+
+    def test_a_full_window_is_handed_back_not_waited_out(self):
+        self.api.answers = [fail(429, "RATE_LIMIT_EXCEEDED", "slow down", **{"Retry-After": "540"})]
+        with self.assertRaises(OmazyError) as cm:
+            self.client().whoami()
+        self.assertEqual((cm.exception.status, cm.exception.retry_after), (429, 540))
+        self.assertEqual((len(self.api.seen), self.slept), (1, []))
+
+    def test_a_400_is_not_retried(self):
+        self.api.answers = [fail(400, "BAD_REQUEST", "messages is required")]
+        with self.assertRaises(OmazyError):
+            self.client().ai.complete([])
+        self.assertEqual(len(self.api.seen), 1)
+
+    def test_no_server_is_a_network_error_after_retries(self):
+        o = Omazy("cai_abc.def", base_url="http://127.0.0.1:9/core", sleep=self.slept.append, max_retries=1, timeout=2)
+        with self.assertRaises(OmazyError) as cm:
+            o.whoami()
+        self.assertEqual((cm.exception.status, cm.exception.code), (0, "NETWORK_ERROR"))
+        self.assertEqual(len(self.slept), 1)
+
+
+class StreamTest(Base):
+    def test_frames_and_characters_split_across_chunks(self):
+        whole = 'event: delta\ndata: {"text":"নমস্কার"}\n\nevent: delta\ndata: {"text":" world"}\n\nevent: done\ndata: {"text":"নমস্কার world","stop_reason":"stop","model":"m","usage":{}}\n\n'.encode()
+        self.api.answers = [(200, {}, [whole[:31], whole[31:70], whole[70:]])]
+        events = list(self.client().ai.stream([{"role": "user", "content": "hi"}]))
+        self.assertEqual([e["text"] for e in events if e["type"] == "delta"], ["নমস্কার", " world"])
+        self.assertEqual(events[-1], {"type": "done", "result": {"text": "নমস্কার world", "stop_reason": "stop", "model": "m", "usage": {}}})
+        self.assertTrue(json.loads(self.api.seen[0]["body"])["stream"])
+
+    def test_an_error_frame_is_raised(self):
+        self.api.answers = [(200, {}, [b'event: delta\ndata: {"text":"a"}\n\nevent: error\ndata: {"message":"the workspace\'s AI budget is spent"}\n\n'])]
+        with self.assertRaises(OmazyError) as cm:
+            list(self.client().ai.stream([{"role": "user", "content": "hi"}]))
+        self.assertEqual((cm.exception.code, cm.exception.message), ("STREAM_ERROR", "the workspace's AI budget is spent"))
+
+    def test_a_stream_that_stops_before_done_is_an_error(self):
+        self.api.answers = [(200, {}, [b'event: delta\ndata: {"text":"half"}\n\n'])]
+        with self.assertRaises(OmazyError) as cm:
+            list(self.client().ai.stream([{"role": "user", "content": "hi"}]))
+        self.assertEqual(cm.exception.code, "STREAM_ERROR")
+
+
+class McpTest(Base):
+    def test_lists_tools_and_calls_one(self):
+        self.api.answers = [rpc({"tools": [{"name": "knowledge_search", "inputSchema": {}}]}), rpc({"content": [{"type": "text", "text": '{"passages":[]}'}], "structuredContent": {"passages": []}, "isError": False})]
+        o = self.client()
+        self.assertEqual([t["name"] for t in o.mcp.list_tools()], ["knowledge_search"])
+        self.assertEqual(o.mcp.call_tool("knowledge_search", {"query": "hours"}), {"text": '{"passages":[]}', "data": {"passages": []}, "is_error": False})
+        sent = json.loads(self.api.seen[1]["body"])
+        self.assertEqual((sent["method"], sent["params"]), ("tools/call", {"name": "knowledge_search", "arguments": {"query": "hours"}}))
+        self.assertEqual(self.api.seen[1]["path"], "/core/mcp")
+
+    def test_a_tool_refusal_is_returned_and_an_unknown_tool_is_raised(self):
+        self.api.answers = [rpc({"content": [{"type": "text", "text": "BAD_REQUEST: query is required"}], "isError": True}), rpc(error={"code": -32602, "message": "Unknown tool: nope"})]
+        o = self.client()
+        self.assertTrue(o.mcp.call_tool("knowledge_search")["is_error"])
+        with self.assertRaises(OmazyError) as cm:
+            o.mcp.call_tool("nope")
+        self.assertEqual(cm.exception.code, "MCP_-32602")
+
+    def test_config_hands_the_server_to_another_mcp_client(self):
+        self.assertEqual(self.client().mcp.config(), {"type": "http", "url": self.api.base + "/mcp", "headers": {"Authorization": "Bearer cai_abc.def"}})
+
+
+class SignatureTest(unittest.TestCase):
+    def test_a_signature_verifies_over_the_exact_body_and_nothing_else(self):
+        header = sign("s3cret", '{"a":1}')
+        self.assertEqual(header, "sha256=" + SIG_VECTOR)
+        self.assertTrue(verify_signature("s3cret", b'{"a":1}', header))
+        self.assertFalse(verify_signature("s3cret", '{"a": 1}', header))
+        self.assertFalse(verify_signature("other", '{"a":1}', header))
+        self.assertFalse(verify_signature("s3cret", '{"a":1}', None))
+        self.assertFalse(verify_signature("", '{"a":1}', header))
+
+
+if __name__ == "__main__":
+    unittest.main()
