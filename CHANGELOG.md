@@ -2,6 +2,20 @@
 
 The TypeScript, Python and Go clients share one version number.
 
+## 0.3.0 (2026-11-20)
+
+Idempotency keys. Nothing in 0.2.0 changed its name or its shape.
+
+- A request that changes something takes an idempotency key: placing a call, posting a message, publishing, running an agent turn, starting a voice job, adding a document, importing a file, adding a source and crawling one. With a key the platform runs the request once and answers a repeat with the first answer, and the client retries the request the way it retries a read. Without a key these are still sent once.
+  - TypeScript: a last argument `{ idempotencyKey }`. `agent.turn` takes an `AbortSignal` as before, or `{ signal, idempotencyKey }`.
+  - Python: a keyword argument `idempotency_key`.
+  - Go: `omazy.WithIdempotencyKey(ctx, key)`.
+- A repeat that arrives while the first request is still running (`409 IDEMPOTENCY_IN_PROGRESS`) is waited out and sent again. The same key with a different request (`422 IDEMPOTENCY_KEY_REUSED`) is an error.
+- The last response says whether it was a replay: `last.replayed` in TypeScript and Python, `Last().Replayed` in Go.
+- `whoami` reports the plan's voice minutes next to its AI turns. Speech, voice jobs and call placement answer `402 PLAN_LIMIT_REACHED` when the minutes are used up.
+- The error of a failed stream carries the API's own error code.
+- Fixed: a voice job named its app in the request body, where the API did not read it, so a workspace with more than one app always got its default app. The app now goes in the query string.
+
 ## 0.2.0 (2026-11-20)
 
 Knowledge documents. Nothing in 0.1.0 changed its name or its shape.

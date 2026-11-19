@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 
 from .errors import OmazyError
-from .routes import RETRYABLE, ROUTES
+from .routes import IDEMPOTENT, RETRYABLE, ROUTES
 
 DEFAULT_BASE_URL = "https://mw.omazy.ai/api/v1/core"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 Json = Dict[str, Any]
 
@@ -29,6 +29,9 @@ class ResponseInfo:
     token_expires_at: Optional[str] = None
     #: True while the caller is still on a token a rotation replaced.
     token_is_previous: bool = False
+    #: True when the answer is the remembered answer of an earlier request
+    #: with the same idempotency key.
+    replayed: bool = False
 
 
 @dataclass
@@ -64,7 +67,14 @@ class Omazy:
     ``token`` is an install token, ``cai_<prefix>.<secret>``. Keep it on a server.
     ``app`` is the default app handle, for a workspace with more than one app.
     ``max_retries`` applies after a 429, 502, 503, 504 or a dropped connection, on
-    routes that are safe to repeat.
+    routes that are safe to repeat and on any request sent with an
+    ``idempotency_key``.
+
+    A method that changes something takes ``idempotency_key``. With a key the
+    platform runs the request once: a repeat with the same key gets the first
+    answer back, so the client retries it like a read. Use a new key for each
+    new request, for example ``str(uuid.uuid4())``, and the same key when you
+    send one again.
     """
 
     def __init__(
@@ -126,6 +136,7 @@ class Omazy:
         raw: Optional[bytes] = None,
         headers: Optional[Mapping[str, str]] = None,
         retries: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
     ) -> _Response:
         method, template = ROUTES[route]
         url_path = template
@@ -140,8 +151,12 @@ class Omazy:
             data = json.dumps(body).encode("utf-8")
             hdrs["Content-Type"] = "application/json"
         hdrs.update(headers or {})
+        # A key makes a request that changes something safe to send again.
+        keyed = bool(idempotency_key) and route in IDEMPOTENT
+        if keyed:
+            hdrs["Idempotency-Key"] = str(idempotency_key)
 
-        attempts = (self._max_retries if retries is None else retries) if route in RETRYABLE else 0
+        attempts = (self._max_retries if retries is None else retries) if (route in RETRYABLE or keyed) else 0
         attempt = 0
         while True:
             req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
@@ -154,7 +169,10 @@ class Omazy:
                 retry_after = _int(e.headers.get("Retry-After"))
                 code, message = _read_error(e)
                 e.close()
-                transient = e.code in (429, 502, 503, 504)
+                # 409 with a key: the first request is still running. Wait and ask again.
+                transient = e.code in (429, 502, 503, 504) or (
+                    keyed and e.code == 409 and code == "IDEMPOTENCY_IN_PROGRESS"
+                )
                 # A long Retry-After means the window is full. Waiting it out
                 # here would hide a stalled caller, so hand that back.
                 if transient and attempt < attempts and (retry_after or 0) <= 30:
@@ -182,6 +200,7 @@ def _info(h: Mapping[str, str]) -> ResponseInfo:
         rate_reset_seconds=_int(h.get("X-RateLimit-Reset")),
         token_expires_at=h.get("X-Omazy-Token-Expires-At"),
         token_is_previous=h.get("X-Omazy-Token-Use") == "previous",
+        replayed=h.get("Idempotent-Replayed") == "true",
     )
 
 
@@ -269,13 +288,21 @@ class _Knowledge:
         body = self._c._with_app({"query": query, "top_k": top_k, "language": language}, app)
         return (self._c._json("knowledge.search", body=body) or {}).get("passages") or []
 
-    def import_file(self, file: bytes, filename: str, content_type: str = "application/octet-stream", app: Optional[str] = None) -> Json:
+    def import_file(
+        self,
+        file: bytes,
+        filename: str,
+        content_type: str = "application/octet-stream",
+        app: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Json:
         """Turn a file into a document: PDF, spreadsheet, image or text, at most 20 MB. Needs ``kb:write``."""
         return self._c._json(
             "knowledge.import_file",
             raw=file,
             query={"filename": filename, "app": app or self._c._app},
             headers={"Content-Type": content_type},
+            idempotency_key=idempotency_key,
         )
 
     def export(self, since: Optional[int] = None, cursor: Optional[str] = None, limit: Optional[int] = None, app: Optional[str] = None) -> Json:
@@ -311,17 +338,24 @@ class _Documents:
         """One document with its content and how its indexing stands. Needs ``kb:read``."""
         return self._c._json("knowledge.documents.get", path={"id": document_id}, query={"app": app or self._c._app})
 
-    def create(self, title: str, content: Optional[str] = None, app: Optional[str] = None, **fields: Any) -> Json:
+    def create(
+        self,
+        title: str,
+        content: Optional[str] = None,
+        app: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        **fields: Any,
+    ) -> Json:
         """Add a document. It is indexed in the background.
 
         Read it again, or wait for ``kb.updated``, to see ``index.status``
         reach ``ready``. Other fields: ``kind``, ``source_url``, ``data``,
         ``language``, ``is_active``. Sending a document that already exists in
-        every field returns the existing one. Never retried by the client.
-        Needs ``kb:write``.
+        every field returns the existing one. Retried only with an
+        ``idempotency_key``. Needs ``kb:write``.
         """
         body = self._c._with_app({"title": title, "content": content, **fields}, app)
-        return self._c._json("knowledge.documents.create", body=body)
+        return self._c._json("knowledge.documents.create", body=body, idempotency_key=idempotency_key)
 
     def update(self, document_id: str, app: Optional[str] = None, **fields: Any) -> Json:
         """Change the fields given and index the document again. Needs ``kb:write``."""
@@ -340,14 +374,26 @@ class _Sources:
         """The websites the knowledge base is crawled from. Needs ``kb:read``."""
         return (self._c._json("knowledge.sources.list", query={"app": app or self._c._app}) or {}).get("sources") or []
 
-    def create(self, root_url: str, max_pages: Optional[int] = None, max_depth: Optional[int] = None, app: Optional[str] = None) -> Json:
+    def create(
+        self,
+        root_url: str,
+        max_pages: Optional[int] = None,
+        max_depth: Optional[int] = None,
+        app: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> Json:
         """Add a website and start crawling it. Each page becomes a document. Needs ``kb:write``."""
         body = self._c._with_app({"root_url": root_url, "max_pages": max_pages, "max_depth": max_depth}, app)
-        return self._c._json("knowledge.sources.create", body=body)
+        return self._c._json("knowledge.sources.create", body=body, idempotency_key=idempotency_key)
 
-    def crawl(self, source_id: str, app: Optional[str] = None) -> Json:
+    def crawl(self, source_id: str, app: Optional[str] = None, idempotency_key: Optional[str] = None) -> Json:
         """Crawl a source again. Needs ``kb:write``."""
-        return self._c._json("knowledge.sources.crawl", path={"id": source_id}, query={"app": app or self._c._app})
+        return self._c._json(
+            "knowledge.sources.crawl",
+            path={"id": source_id},
+            query={"app": app or self._c._app},
+            idempotency_key=idempotency_key,
+        )
 
 
 class _Agent:
@@ -361,9 +407,12 @@ class _Agent:
         session_id: Optional[str] = None,
         language: Optional[str] = None,
         app: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
         **options: Any,
     ) -> Json:
-        """One turn of the workspace's own agent. Needs ``agent:run``. Never retried.
+        """One turn of the workspace's own agent. Needs ``agent:run``.
+
+        A turn may fire a tool, so it is retried only with an ``idempotency_key``.
 
         The caller keeps the conversation: pass earlier turns in ``history``
         (``{"role": "user"|"assistant", "text": ...}``, oldest first) and reuse
@@ -372,17 +421,29 @@ class _Agent:
         body = self._c._with_app(
             {"message": message, "history": history, "session_id": session_id, "language": language, **options}, app
         )
-        return self._c._json("agent.turn", body=body)
+        return self._c._json("agent.turn", body=body, idempotency_key=idempotency_key)
 
 
 class _Calls:
     def __init__(self, c: Omazy) -> None:
         self._c = c
 
-    def place(self, to: str, purpose: str, consent_basis: str, app: Optional[str] = None, **options: Any) -> Json:
-        """Queue an outbound call answered by the agent. Needs ``voice:calls``. Never retried."""
+    def place(
+        self,
+        to: str,
+        purpose: str,
+        consent_basis: str,
+        app: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        **options: Any,
+    ) -> Json:
+        """Queue an outbound call answered by the agent. Needs ``voice:calls``.
+
+        Retried only with an ``idempotency_key``, so a phone never rings twice
+        for one request.
+        """
         body = self._c._with_app({"to": to, "purpose": purpose, "consent_basis": consent_basis, **options}, app)
-        return self._c._json("voice.calls.place", body=body)
+        return self._c._json("voice.calls.place", body=body, idempotency_key=idempotency_key)
 
     def get(self, ref: str, app: Optional[str] = None) -> Json:
         """Where a call stands and what the person answered."""
@@ -393,9 +454,15 @@ class _Jobs:
     def __init__(self, c: Omazy) -> None:
         self._c = c
 
-    def create(self, kind: str, app: Optional[str] = None, **options: Any) -> Json:
+    def create(self, kind: str, app: Optional[str] = None, idempotency_key: Optional[str] = None, **options: Any) -> Json:
         """Transcribe a recording or write notes from one, in the background. Needs ``voice:tasks``."""
-        return self._c._json("voice.jobs.create", body=self._c._with_app({"kind": kind, **options}, app))
+        # This route reads the app from the query string.
+        return self._c._json(
+            "voice.jobs.create",
+            body=_drop_none({"kind": kind, **options}),
+            query={"app": app or self._c._app},
+            idempotency_key=idempotency_key,
+        )
 
     def get(self, job_id: str, app: Optional[str] = None) -> Json:
         return self._c._json("voice.jobs.get", path={"id": job_id}, query={"app": app or self._c._app})
@@ -439,18 +506,35 @@ class _Conversations:
     def __init__(self, c: Omazy) -> None:
         self._c = c
 
-    def post_message(self, conversation_id: str, blocks: List[Json]) -> Json:
-        """Post 1 to 12 blocks into an existing conversation as the app. Needs ``core:write``. Never retried."""
-        return self._c._json("conversations.post_message", path={"id": conversation_id}, body={"blocks": blocks})
+    def post_message(self, conversation_id: str, blocks: List[Json], idempotency_key: Optional[str] = None) -> Json:
+        """Post 1 to 12 blocks into an existing conversation as the app. Needs ``core:write``.
+
+        Retried only with an ``idempotency_key``.
+        """
+        return self._c._json(
+            "conversations.post_message",
+            path={"id": conversation_id},
+            body={"blocks": blocks},
+            idempotency_key=idempotency_key,
+        )
 
 
 class _Channels:
     def __init__(self, c: Omazy) -> None:
         self._c = c
 
-    def linkedin_publish(self, text: str, app: Optional[str] = None, **options: Any) -> Json:
-        """Publish a post to the connected LinkedIn page. Needs ``channels:publish``. Never retried."""
-        return self._c._json("channels.linkedin_publish", body=self._c._with_app({"text": text, **options}, app))
+    def linkedin_publish(
+        self, text: str, app: Optional[str] = None, idempotency_key: Optional[str] = None, **options: Any
+    ) -> Json:
+        """Publish a post to the connected LinkedIn page. Needs ``channels:publish``.
+
+        Retried only with an ``idempotency_key``.
+        """
+        return self._c._json(
+            "channels.linkedin_publish",
+            body=self._c._with_app({"text": text, **options}, app),
+            idempotency_key=idempotency_key,
+        )
 
 
 class _Sessions:

@@ -18,7 +18,7 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.2.0/omazyai-sdk-0.2.0.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.3.0/omazyai-sdk-0.3.0.tgz
 ```
 
 ## Use
@@ -93,6 +93,23 @@ for await (const ev of omazy.ai.stream({ messages })) {
   else console.log('\n', ev.result.usage)
 }
 ```
+
+## Sending a request again
+
+A read is retried for you. A request that changes something is not: placing a call, posting a message, publishing, running an agent turn and adding knowledge are sent once. Give one a key and it becomes safe to repeat. The platform runs it once and answers a repeat with the first answer, so the client retries it like a read.
+
+```ts
+const key = crypto.randomUUID() // keep it with the order, the visit, the job
+
+await omazy.voice.calls.place(
+  { to: '+447700900123', purpose: 'confirmation', consent_basis: 'transaction', opening: 'Hello, this is Nordwell.' },
+  { idempotencyKey: key },
+)
+```
+
+Use a new key for each new request, and the same key when you send one again, also from another process or after a restart. A successful answer is remembered for 24 hours. A failed request is not remembered. The same key with a different request is refused with `IDEMPOTENCY_KEY_REUSED`. `omazy.last.replayed` is true when the answer was a remembered one.
+
+The methods that take a key: `knowledge.documents.create`, `knowledge.importFile`, `knowledge.sources.create`, `knowledge.sources.crawl`, `agent.turn`, `voice.calls.place`, `voice.jobs.create`, `conversations.postMessage` and `channels.linkedinPublish`.
 
 ## Errors
 

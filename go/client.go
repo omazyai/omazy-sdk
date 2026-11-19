@@ -31,7 +31,7 @@ const (
 	// DefaultBaseURL is the production Core API.
 	DefaultBaseURL = "https://mw.omazy.ai/api/v1/core"
 	// Version of this client.
-	Version = "0.2.0"
+	Version = "0.3.0"
 )
 
 // Error is a refusal or failure from the Core API. Branch on Code, log Message.
@@ -60,6 +60,9 @@ type ResponseInfo struct {
 	TokenExpiresAt string
 	// TokenIsPrevious is true while the caller is still on a token a rotation replaced.
 	TokenIsPrevious bool
+	// Replayed is true when the answer is the remembered answer of an earlier
+	// request with the same idempotency key.
+	Replayed bool
 }
 
 // Client calls the Core API. Create one with New and reuse it.
@@ -142,6 +145,22 @@ func (c *Client) Whoami(ctx context.Context) (*Whoami, error) {
 	return &out, c.json(ctx, "whoami", call{}, &out)
 }
 
+type idempotencyKey struct{}
+
+// WithIdempotencyKey names the request made with the returned context, so it
+// can be sent again safely. It applies to the calls that change something:
+// PlaceCall, PostMessage, LinkedInPublish, Turn, CreateJob, CreateDocument,
+// ImportFile, CreateSource and CrawlSource. The platform runs a request with a
+// key once; a repeat with the same key gets the first answer back, so the
+// client retries it like a read. Use a new key for each new request and the
+// same key when you send one again.
+//
+//	ctx := omazy.WithIdempotencyKey(ctx, orderID)
+//	res, err := c.Voice.PlaceCall(ctx, req)
+func WithIdempotencyKey(ctx context.Context, key string) context.Context {
+	return context.WithValue(ctx, idempotencyKey{}, key)
+}
+
 // call is the variable part of a request.
 type call struct {
 	path    map[string]string
@@ -210,8 +229,11 @@ func (c *Client) send(ctx context.Context, name string, in call) (*http.Response
 		}
 		payload = b
 	}
+	// A key makes a request that changes something safe to send again.
+	key, _ := ctx.Value(idempotencyKey{}).(string)
+	keyed := key != "" && idempotent[name]
 	attempts := 0
-	if retryable[name] && !in.noRetry {
+	if (retryable[name] || keyed) && !in.noRetry {
 		attempts = c.maxRetries
 	}
 	for attempt := 0; ; attempt++ {
@@ -230,6 +252,9 @@ func (c *Client) send(ctx context.Context, name string, in call) (*http.Response
 		}
 		for k, v := range in.headers {
 			req.Header.Set(k, v)
+		}
+		if keyed {
+			req.Header.Set("Idempotency-Key", key)
 		}
 		res, err := c.http.Do(req)
 		if err != nil {
@@ -253,7 +278,9 @@ func (c *Client) send(ctx context.Context, name string, in call) (*http.Response
 		}
 		apiErr := readError(res, info.RequestID)
 		res.Body.Close()
-		transient := res.StatusCode == 429 || res.StatusCode == 502 || res.StatusCode == 503 || res.StatusCode == 504
+		transient := res.StatusCode == 429 || res.StatusCode == 502 || res.StatusCode == 503 || res.StatusCode == 504 ||
+			// The first request with this key is still running: wait and ask again.
+			(keyed && res.StatusCode == 409 && apiErr.Code == "IDEMPOTENCY_IN_PROGRESS")
 		// A long Retry-After means the window is full. Waiting it out here
 		// would hide a stalled caller, so hand that back.
 		if transient && attempt < attempts && apiErr.RetryAfter <= 30*time.Second {
@@ -287,6 +314,7 @@ func readInfo(h http.Header) ResponseInfo {
 		RateReset:       time.Duration(n("X-RateLimit-Reset")) * time.Second,
 		TokenExpiresAt:  h.Get("X-Omazy-Token-Expires-At"),
 		TokenIsPrevious: h.Get("X-Omazy-Token-Use") == "previous",
+		Replayed:        h.Get("Idempotent-Replayed") == "true",
 	}
 }
 
@@ -613,9 +641,11 @@ func (s *VoiceService) GetCall(ctx context.Context, ref, app string) (*CallStatu
 
 // CreateJob starts a background voice task. Needs voice:tasks.
 func (s *VoiceService) CreateJob(ctx context.Context, req VoiceJobRequest) (map[string]any, error) {
-	req.App = s.c.appOr(req.App)
+	// This route reads the app from the query string.
+	app := s.c.appOr(req.App)
+	req.App = ""
 	var out map[string]any
-	return out, s.c.json(ctx, "voice.jobs.create", call{body: req}, &out)
+	return out, s.c.json(ctx, "voice.jobs.create", call{body: req, query: map[string]string{"app": app}}, &out)
 }
 
 // GetJob reads a voice task and, when it is done, its transcript or notes.

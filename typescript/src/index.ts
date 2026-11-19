@@ -1,6 +1,6 @@
 import { OmazyError } from './errors.js'
 import { McpClient } from './mcp.js'
-import { RETRYABLE, ROUTES, type RouteName } from './routes.js'
+import { IDEMPOTENT, RETRYABLE, ROUTES, type RouteName } from './routes.js'
 import { readSse } from './sse.js'
 import type {
   AgentTurnRequest,
@@ -25,12 +25,12 @@ import type {
 
 export { OmazyError } from './errors.js'
 export { McpClient, type McpTool, type McpToolResult } from './mcp.js'
-export { ROUTES, RETRYABLE, type RouteName } from './routes.js'
+export { ROUTES, RETRYABLE, IDEMPOTENT, type RouteName } from './routes.js'
 export { readSse, type SseFrame } from './sse.js'
 export type * from './types.js'
 
 export const DEFAULT_BASE_URL = 'https://mw.omazy.ai/api/v1/core'
-export const VERSION = '0.2.0'
+export const VERSION = '0.3.0'
 
 export interface OmazyOptions {
   /** An install token, `cai_<prefix>.<secret>`. Server side only. */
@@ -38,11 +38,24 @@ export interface OmazyOptions {
   baseUrl?: string
   /** Default app handle, for a workspace with more than one app. */
   app?: string
-  /** Retries after a 429, 502, 503, 504 or a dropped connection, on routes that are safe to repeat. Default 2. */
+  /**
+   * Retries after a 429, 502, 503, 504 or a dropped connection, on routes that
+   * are safe to repeat and on any request sent with an idempotency key. Default 2.
+   */
   maxRetries?: number
   /** Give up on a request after this long. Default 130 s, just above the API's own limit. */
   timeoutMs?: number
   fetch?: typeof fetch
+}
+
+/**
+ * For a request that changes something. With a key the platform runs the
+ * request once: a repeat with the same key gets the first answer back, so the
+ * client retries it like a read. Use a new key for each new request, for
+ * example `crypto.randomUUID()`, and the same key when you send one again.
+ */
+export interface WriteOptions {
+  idempotencyKey?: string
 }
 
 /** What the API said about limits and the token on the last response. */
@@ -53,6 +66,8 @@ export interface ResponseInfo {
   tokenExpiresAt?: string
   /** True while the caller is still on a token a rotation replaced. */
   tokenIsPrevious: boolean
+  /** True when the answer is the remembered answer of an earlier request with the same idempotency key. */
+  replayed: boolean
 }
 
 interface CallInit {
@@ -62,6 +77,7 @@ interface CallInit {
   body?: BodyInit
   headers?: Record<string, string>
   signal?: AbortSignal
+  idempotencyKey?: string
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -83,7 +99,7 @@ export class Omazy {
   private readonly timeoutMs: number
   private readonly fetcher: typeof fetch
   /** Headers of the most recent response: request id, rate limit, token deadline. */
-  last: ResponseInfo = { tokenIsPrevious: false }
+  last: ResponseInfo = { tokenIsPrevious: false, replayed: false }
 
   readonly mcp: McpClient
 
@@ -136,11 +152,14 @@ export class Omazy {
       /**
        * Add a document. It is indexed in the background: read it again, or wait
        * for `kb.updated`, to see `index.status` reach `ready`. Sending a document
-       * that already exists in every field returns the existing one. Never
-       * retried by the client. Needs `kb:write`.
+       * that already exists in every field returns the existing one. Retried
+       * only with an idempotency key. Needs `kb:write`.
        */
-      create: (doc: DocumentInput) =>
-        this.json<KnowledgeDocument>('knowledge.documents.create', { json: this.withApp(doc) }),
+      create: (doc: DocumentInput, opts: WriteOptions = {}) =>
+        this.json<KnowledgeDocument>('knowledge.documents.create', {
+          json: this.withApp(doc),
+          idempotencyKey: opts.idempotencyKey,
+        }),
       /** Change the fields given and index the document again. Needs `kb:write`. */
       update: (id: string, patch: DocumentPatch) =>
         this.json<KnowledgeDocument>('knowledge.documents.update', { path: { id }, json: this.withApp(patch) }),
@@ -156,11 +175,12 @@ export class Omazy {
      * Turn a file into a document: PDF, spreadsheet, image or text, at most
      * 20 MB. `file` is the raw bytes. Needs `kb:write`.
      */
-    importFile: (file: BodyInit, opts: { filename: string; contentType?: string; app?: string }) =>
+    importFile: (file: BodyInit, opts: { filename: string; contentType?: string; app?: string } & WriteOptions) =>
       this.json<KnowledgeDocument>('knowledge.import_file', {
         body: file,
         query: { filename: opts.filename, app: opts.app ?? this.app },
         headers: { 'content-type': opts.contentType ?? 'application/octet-stream' },
+        idempotencyKey: opts.idempotencyKey,
       }),
 
     sources: {
@@ -168,13 +188,14 @@ export class Omazy {
       list: async (opts: { app?: string } = {}) =>
         (await this.json<{ sources: Json[] }>('knowledge.sources.list', { query: { app: opts.app ?? this.app } })).sources ?? [],
       /** Add a website and start crawling it. Each page becomes a document. Needs `kb:write`. */
-      create: (req: { root_url: string; max_pages?: number; max_depth?: number; app?: string }) =>
-        this.json<Json>('knowledge.sources.create', { json: this.withApp(req) }),
+      create: (req: { root_url: string; max_pages?: number; max_depth?: number; app?: string }, opts: WriteOptions = {}) =>
+        this.json<Json>('knowledge.sources.create', { json: this.withApp(req), idempotencyKey: opts.idempotencyKey }),
       /** Crawl a source again. Needs `kb:write`. */
-      crawl: (id: string, opts: { app?: string } = {}) =>
+      crawl: (id: string, opts: { app?: string } & WriteOptions = {}) =>
         this.json<{ id: string; queued: boolean }>('knowledge.sources.crawl', {
           path: { id },
           query: { app: opts.app ?? this.app },
+          idempotencyKey: opts.idempotencyKey,
         }),
     },
 
@@ -196,9 +217,19 @@ export class Omazy {
   }
 
   readonly agent = {
-    /** One turn of the workspace's own agent. The caller keeps the conversation. Needs `agent:run`. */
-    turn: (req: AgentTurnRequest, signal?: AbortSignal) =>
-      this.json<AgentTurnResult>('agent.turn', { json: this.withApp(req), signal }),
+    /**
+     * One turn of the workspace's own agent. The caller keeps the conversation.
+     * A turn may fire a tool, so it is retried only with an idempotency key.
+     * The second argument is an AbortSignal, or options holding one. Needs `agent:run`.
+     */
+    turn: (req: AgentTurnRequest, opts?: AbortSignal | (WriteOptions & { signal?: AbortSignal })) => {
+      const o = opts instanceof AbortSignal ? { signal: opts } : (opts ?? {})
+      return this.json<AgentTurnResult>('agent.turn', {
+        json: this.withApp(req),
+        signal: o.signal,
+        idempotencyKey: (o as WriteOptions).idempotencyKey,
+      })
+    },
   }
 
   readonly voice = {
@@ -215,15 +246,23 @@ export class Omazy {
         headers: { 'content-type': opts.contentType ?? 'application/octet-stream' },
       }),
     calls: {
-      /** Queue an outbound call answered by the agent. Never retried. Needs `voice:calls`. */
-      place: (req: CallRequest) => this.json<CallResult>('voice.calls.place', { json: this.withApp(req) }),
+      /**
+       * Queue an outbound call answered by the agent. Retried only with an
+       * idempotency key, so a phone never rings twice for one request. Needs `voice:calls`.
+       */
+      place: (req: CallRequest, opts: WriteOptions = {}) =>
+        this.json<CallResult>('voice.calls.place', { json: this.withApp(req), idempotencyKey: opts.idempotencyKey }),
       /** Where a call stands and what the person answered. */
       get: (ref: string, opts: { app?: string } = {}) =>
         this.json<CallStatus>('voice.calls.get', { path: { ref }, query: { app: opts.app ?? this.app } }),
     },
     jobs: {
       /** Transcribe a recording or write notes from one, in the background. Needs `voice:tasks`. */
-      create: (req: VoiceJobRequest) => this.json<Json>('voice.jobs.create', { json: this.withApp(req) }),
+      create: (req: VoiceJobRequest, opts: WriteOptions = {}) => {
+        // This route reads the app from the query string.
+        const { app, ...body } = this.withApp(req)
+        return this.json<Json>('voice.jobs.create', { json: body, query: { app }, idempotencyKey: opts.idempotencyKey })
+      },
       get: (id: string, opts: { app?: string } = {}) =>
         this.json<Json>('voice.jobs.get', { path: { id }, query: { app: opts.app ?? this.app } }),
     },
@@ -241,15 +280,15 @@ export class Omazy {
   }
 
   readonly conversations = {
-    /** Post 1 to 12 blocks into an existing conversation as the app. Never retried. Needs `core:write`. */
-    postMessage: (id: string, blocks: Block[]) =>
-      this.json<Json>('conversations.post_message', { path: { id }, json: { blocks } }),
+    /** Post 1 to 12 blocks into an existing conversation as the app. Retried only with an idempotency key. Needs `core:write`. */
+    postMessage: (id: string, blocks: Block[], opts: WriteOptions = {}) =>
+      this.json<Json>('conversations.post_message', { path: { id }, json: { blocks }, idempotencyKey: opts.idempotencyKey }),
   }
 
   readonly channels = {
-    /** Publish a post to the connected LinkedIn page. Never retried. Needs `channels:publish`. */
-    linkedinPublish: (req: { text: string; app?: string; [key: string]: unknown }) =>
-      this.json<Json>('channels.linkedin_publish', { json: this.withApp(req) }),
+    /** Publish a post to the connected LinkedIn page. Retried only with an idempotency key. Needs `channels:publish`. */
+    linkedinPublish: (req: { text: string; app?: string; [key: string]: unknown }, opts: WriteOptions = {}) =>
+      this.json<Json>('channels.linkedin_publish', { json: this.withApp(req), idempotencyKey: opts.idempotencyKey }),
   }
 
   readonly sessions = {
@@ -306,8 +345,13 @@ export class Omazy {
       ...(init.json !== undefined ? { 'content-type': 'application/json' } : {}),
       ...init.headers,
     }
+    // A key makes a request that changes something safe to send again.
+    const keyed = Boolean(init.idempotencyKey) && IDEMPOTENT.has(route)
+    if (keyed) headers['idempotency-key'] = init.idempotencyKey!
     const body = init.json !== undefined ? JSON.stringify(init.json) : init.body
-    const attempts = RETRYABLE.has(route) ? retries : 0
+    // A stream can be read once, so a request whose body is one is sent once.
+    const once = typeof ReadableStream !== 'undefined' && body instanceof ReadableStream
+    const attempts = (RETRYABLE.has(route) || keyed) && !once ? retries : 0
 
     for (let attempt = 0; ; attempt++) {
       const timeout = AbortSignal.timeout(this.timeoutMs)
@@ -328,7 +372,13 @@ export class Omazy {
 
       const retryAfter = Number(res.headers.get('retry-after')) || undefined
       const failed = await readError(res)
-      const transient = res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504
+      const transient =
+        res.status === 429 ||
+        res.status === 502 ||
+        res.status === 503 ||
+        res.status === 504 ||
+        // The first request with this key is still running: wait and ask again.
+        (keyed && res.status === 409 && failed.code === 'IDEMPOTENCY_IN_PROGRESS')
       // A long Retry-After means the window is full; waiting it out here would
       // hide a stalled caller. Hand that decision back.
       if (transient && attempt < attempts && (retryAfter ?? 0) <= 30) {
@@ -355,6 +405,7 @@ function readInfo(h: Headers): ResponseInfo {
       : undefined,
     tokenExpiresAt: h.get('x-omazy-token-expires-at') ?? undefined,
     tokenIsPrevious: h.get('x-omazy-token-use') === 'previous',
+    replayed: h.get('idempotent-replayed') === 'true',
   }
 }
 

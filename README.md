@@ -27,19 +27,19 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.2.0/omazyai-sdk-0.2.0.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.3.0/omazyai-sdk-0.3.0.tgz
 ```
 
 **Python.**
 
 ```sh
-pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.2.0/omazy-0.2.0-py3-none-any.whl
+pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.3.0/omazy-0.3.0-py3-none-any.whl
 ```
 
 **Go.**
 
 ```sh
-go get github.com/omazyai/omazy-sdk/go@v0.2.0
+go get github.com/omazyai/omazy-sdk/go@v0.3.0
 ```
 
 ## Your account and your token
@@ -66,7 +66,7 @@ To see what a token is, ask:
 const me = await omazy.whoami()
 // me.scopes            what the token may do
 // me.token_expires_at  when it stops working
-// me.plan              the workspace's plan, its rate per minute, and the AI turns used and included
+// me.plan              the workspace's plan, its rate per minute, and the AI turns and voice minutes used and included
 ```
 
 ## First call
@@ -102,9 +102,10 @@ Each folder's README lists every method and the scope it needs.
 ## What every client does
 
 - **Errors.** A refusal is one error type carrying the HTTP status, a stable `code`, the message and the request id.
-- **Retries.** A 429, 502, 503, 504 or a dropped connection is retried twice, only on routes that read or compute. Placing a call, posting a message, publishing and running an agent turn are never sent twice. A `Retry-After` over 30 seconds is handed back to the caller.
+- **Retries.** A 429, 502, 503, 504 or a dropped connection is retried twice, only on routes that read or compute. Placing a call, posting a message, publishing, running an agent turn and adding knowledge are never sent twice on the client's own decision. A `Retry-After` over 30 seconds is handed back to the caller.
+- **Idempotency keys.** Give a request that changes something a key and it becomes safe to send again: the platform runs it once and answers a repeat with the first answer. With a key the client retries it like a read.
 - **Streaming.** A completion can be read as it is written. A stream that reports an error or stops before it is done is an error, never a short answer.
-- **Response headers.** The request id, the rate limit and the token's deadline are readable after each call.
+- **Response headers.** The request id, the rate limit, the token's deadline and whether the answer was a replay are readable after each call.
 - **MCP.** List and call the tools the token's scopes allow, or get the URL and headers to hand to another MCP client.
 - **Signatures.** Verify a request the platform sent to your server (`X-Omazy-Signature`). All three test against the same vector.
 
@@ -112,10 +113,11 @@ The TypeScript package also has what your own Worker needs (`@omazyai/sdk/server
 
 ## Plans and limits
 
-The workspace's plan decides how much a token may do. Two numbers matter, and `whoami` reports both.
+The workspace's plan decides how much a token may do. Three numbers matter, and `whoami` reports them.
 
 - **Rate.** Each token has a number of calls per 10 minutes in each bucket, sized by the plan. Responses carry `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset`. Past it the API answers `429`.
 - **AI turns.** A completion or an agent turn uses one AI turn from the plan's allowance for the period. When the allowance is used up the API answers `402 PLAN_LIMIT_REACHED` until the period resets or the plan changes.
+- **Voice minutes.** Speech, voice jobs and phone calls draw on the plan's voice minutes, and stop with the same `402 PLAN_LIMIT_REACHED` when they are used up.
 
 Details: [Errors and limits](https://docs.omazy.ai/reference/core-api/errors-and-limits/).
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omazy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Client for the Omazy Core API and its MCP server: models, knowledge, your agent, speech and calls from your own backend."
 readme = "README.md"
 requires-python = ">=3.9"

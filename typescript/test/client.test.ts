@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
-import { Omazy, OmazyError, ROUTES, RETRYABLE, type RouteName } from '../src/index'
+import { IDEMPOTENT, Omazy, OmazyError, ROUTES, RETRYABLE, type RouteName } from '../src/index'
 import { READ, readSigned, serveMcp, sign, verifySignature, type Registry } from '../src/server'
 
 // hmac-sha256('s3cret', '{"a":1}') in hex, computed with openssl.
@@ -31,8 +31,14 @@ const client = (fetcher: typeof fetch, extra = {}) =>
 
 describe('contract', () => {
   const contract = JSON.parse(readFileSync(contractPath(), 'utf8')) as {
-    routes: { method: string; path: string; sdk: string }[]
+    routes: { method: string; path: string; sdk: string; idempotency_key?: boolean }[]
   }
+
+  test('the routes that take an idempotency key are the ones the contract marks', () => {
+    const want = contract.routes.filter((r) => r.idempotency_key).map((r) => r.sdk).sort()
+    expect([...IDEMPOTENT].sort()).toEqual(want)
+    for (const name of IDEMPOTENT) expect(RETRYABLE.has(name)).toBe(false)
+  })
 
   test('the route table is the contract, route for route', () => {
     const want = Object.fromEntries(contract.routes.map((r) => [r.sdk, [r.method, r.path]]))
@@ -115,7 +121,7 @@ describe('requests', () => {
     const { fetcher } = mock(ok({}, { 'x-request-id': 'req_9', 'x-ratelimit-limit': '600', 'x-ratelimit-remaining': '12', 'x-ratelimit-reset': '3', 'x-omazy-token-use': 'previous', 'x-omazy-token-expires-at': '2026-12-01T00:00:00Z' }))
     const o = client(fetcher)
     await o.whoami()
-    expect(o.last).toEqual({ requestId: 'req_9', rateLimit: { limit: 600, remaining: 12, resetSeconds: 3 }, tokenExpiresAt: '2026-12-01T00:00:00Z', tokenIsPrevious: true })
+    expect(o.last).toEqual({ requestId: 'req_9', rateLimit: { limit: 600, remaining: 12, resetSeconds: 3 }, tokenExpiresAt: '2026-12-01T00:00:00Z', tokenIsPrevious: true, replayed: false })
   })
 })
 
@@ -152,6 +158,71 @@ describe('retries', () => {
     const err = await client(fetcher, { maxRetries: 1 }).whoami().catch((e) => e)
     expect(err).toMatchObject({ status: 0, code: 'NETWORK_ERROR' })
     expect(seen).toHaveLength(2)
+  })
+})
+
+describe('idempotency keys', () => {
+  const call = { to: '+8801712345678', purpose: 'reminder', consent_basis: 'customer' }
+
+  test('a call placed with a key is sent again with the same key', async () => {
+    const { fetcher, seen } = mock(fail(503, 'UPSTREAM_UNAVAILABLE', 'busy', { 'retry-after': '0' }), ok({ ref: 'r1', status: 'pending' }, { 'idempotent-replayed': 'true' }))
+    const o = client(fetcher)
+    const res = await o.voice.calls.place(call, { idempotencyKey: 'visit-77' })
+    expect(res.ref).toBe('r1')
+    expect(seen).toHaveLength(2)
+    expect(seen.map((s) => s.headers.get('idempotency-key'))).toEqual(['visit-77', 'visit-77'])
+    expect(o.last.replayed).toBe(true)
+  })
+
+  test('a repeat that arrives while the first still runs waits and asks again', async () => {
+    const { fetcher, seen } = mock(fail(409, 'IDEMPOTENCY_IN_PROGRESS', 'still running', { 'retry-after': '0' }), ok({ session_id: 's', text: 'hi' }))
+    const res = await client(fetcher).agent.turn({ message: 'hi' }, { idempotencyKey: 'turn-1' })
+    expect(res.text).toBe('hi')
+    expect(seen).toHaveLength(2)
+  })
+
+  test('a key used with another request is reported, not retried', async () => {
+    const { fetcher, seen } = mock(fail(422, 'IDEMPOTENCY_KEY_REUSED', 'used with a different request'))
+    const err = await client(fetcher).voice.calls.place(call, { idempotencyKey: 'visit-77' }).catch((e) => e)
+    expect(err).toMatchObject({ status: 422, code: 'IDEMPOTENCY_KEY_REUSED' })
+    expect(seen).toHaveLength(1)
+  })
+
+  test('without a key nothing is added and nothing is repeated', async () => {
+    const { fetcher, seen } = mock(fail(409, 'IDEMPOTENCY_IN_PROGRESS', 'still running', { 'retry-after': '0' }))
+    await client(fetcher).conversations.postMessage('s1', [{ type: 'text', markdown: 'hi' }]).catch(() => {})
+    expect(seen).toHaveLength(1)
+    expect(seen[0]!.headers.has('idempotency-key')).toBe(false)
+  })
+
+  test('every route that takes a key sends it', async () => {
+    const { fetcher, seen } = mock(() => ok({}))
+    const o = client(fetcher)
+    const k = { idempotencyKey: 'k1' }
+    await o.knowledge.documents.create({ title: 't', content: 'c' }, k)
+    await o.knowledge.importFile(new Uint8Array([1]), { filename: 'a.pdf', ...k })
+    await o.knowledge.sources.create({ root_url: 'https://x.test' }, k)
+    await o.knowledge.sources.crawl('c1', k)
+    await o.agent.turn({ message: 'hi' }, k)
+    await o.voice.calls.place(call, k)
+    await o.voice.jobs.create({ kind: 'transcribe', source_url: 'https://x.test/a.mp3' }, k)
+    await o.conversations.postMessage('s1', [{ type: 'text', markdown: 'hi' }], k)
+    await o.channels.linkedinPublish({ text: 'hi' }, k)
+    expect(seen).toHaveLength(IDEMPOTENT.size)
+    for (const s of seen) expect(s.headers.get('idempotency-key')).toBe('k1')
+  })
+
+  test('an agent turn still takes a bare AbortSignal', async () => {
+    const { fetcher, seen } = mock(ok({ session_id: 's', text: 'hi' }))
+    await client(fetcher).agent.turn({ message: 'hi' }, new AbortController().signal)
+    expect(seen[0]!.headers.has('idempotency-key')).toBe(false)
+  })
+
+  test('a voice job names its app in the query, where the route reads it', async () => {
+    const { fetcher, seen } = mock(ok({ id: 'j1' }))
+    await client(fetcher, { app: 'nordwell' }).voice.jobs.create({ kind: 'transcribe', source_url: 'https://x.test/a.mp3' })
+    expect(new URL(seen[0]!.url).searchParams.get('app')).toBe('nordwell')
+    expect(JSON.parse(seen[0]!.body)).toEqual({ kind: 'transcribe', source_url: 'https://x.test/a.mp3' })
   })
 })
 

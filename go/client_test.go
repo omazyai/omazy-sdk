@@ -20,6 +20,8 @@ const sigVector = "5910e62016ef5034272c926c27071992a465c2335cecf41851bda071577f4
 
 type seen struct {
 	method, path, auth, body string
+	// key is the Idempotency-Key header.
+	key string
 }
 
 // fakeAPI is a real HTTP server that answers from a queue and records what it
@@ -37,7 +39,7 @@ func newFake(t *testing.T, answers ...func(http.ResponseWriter, *http.Request)) 
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
-		f.seen = append(f.seen, seen{r.Method, r.URL.RequestURI(), r.Header.Get("Authorization"), string(b)})
+		f.seen = append(f.seen, seen{r.Method, r.URL.RequestURI(), r.Header.Get("Authorization"), string(b), r.Header.Get("Idempotency-Key")})
 		a := f.answers[0]
 		if len(f.answers) > 1 {
 			f.answers = f.answers[1:]
@@ -87,9 +89,10 @@ func sse(chunks ...string) func(http.ResponseWriter, *http.Request) {
 var ctx = context.Background()
 var hi = []Message{{Role: "user", Content: "hi"}}
 
-func TestRouteTableIsTheContract(t *testing.T) {
-	// The contract sits beside the SDKs: one level up in the public
-	// repository, two in the platform's own.
+// readContract reads the route contract. It sits beside the SDKs: one level
+// up in the public repository, two in the platform's own.
+func readContract(t *testing.T) []byte {
+	t.Helper()
 	b, err := os.ReadFile("../contracts/core-api.routes.json")
 	if err != nil {
 		b, err = os.ReadFile("../../contracts/core-api.routes.json")
@@ -97,6 +100,11 @@ func TestRouteTableIsTheContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return b
+}
+
+func TestRouteTableIsTheContract(t *testing.T) {
+	b := readContract(t)
 	var doc struct {
 		Routes []struct{ Method, Path, SDK string }
 	}
@@ -406,5 +414,104 @@ func TestAKnowledgeWriteIsNeverSentTwiceAndAReadIs(t *testing.T) {
 	page, err := c.Knowledge.ListDocuments(ctx, ListOptions{Limit: 10})
 	if err != nil || page.Version != 3 || len(f.seen) != 2 {
 		t.Fatalf("page = %+v, err = %v, sent %d times", page, err, len(f.seen))
+	}
+}
+
+var aCall = CallRequest{To: "+8801712345678", Purpose: "reminder", ConsentBasis: "customer"}
+
+func TestTheRoutesThatTakeAKeyAreTheOnesTheContractMarks(t *testing.T) {
+	var contract struct {
+		Routes []struct {
+			SDK            string `json:"sdk"`
+			IdempotencyKey bool   `json:"idempotency_key"`
+		} `json:"routes"`
+	}
+	if err := json.Unmarshal(readContract(t), &contract); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range contract.Routes {
+		if idempotent[r.SDK] != r.IdempotencyKey {
+			t.Errorf("%s takes an idempotency key: %v; the contract says %v", r.SDK, idempotent[r.SDK], r.IdempotencyKey)
+		}
+		if idempotent[r.SDK] && retryable[r.SDK] {
+			t.Errorf("%s is both retried freely and keyed", r.SDK)
+		}
+	}
+}
+
+func TestACallPlacedWithAKeyIsSentAgainWithTheSameKey(t *testing.T) {
+	f, c := newFake(t, fail(503, "UPSTREAM_UNAVAILABLE", "busy"), ok(`{"ref":"r1"}`, "Idempotent-Replayed", "true"))
+	res, err := c.Voice.PlaceCall(WithIdempotencyKey(ctx, "visit-77"), aCall)
+	if err != nil || res.Ref != "r1" {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+	if len(f.seen) != 2 || f.seen[0].key != "visit-77" || f.seen[1].key != "visit-77" {
+		t.Errorf("requests = %+v", f.seen)
+	}
+	if !c.Last().Replayed {
+		t.Error("the replay was not reported")
+	}
+}
+
+func TestARepeatWhileTheFirstStillRunsWaitsAndAsksAgain(t *testing.T) {
+	f, c := newFake(t, fail(409, "IDEMPOTENCY_IN_PROGRESS", "still running", "Retry-After", "2"), ok(`{"text":"hi"}`))
+	var waits []time.Duration
+	c.sleep = func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }
+	res, err := c.Agent.Turn(WithIdempotencyKey(ctx, "turn-1"), AgentTurnRequest{Message: "hi"})
+	if err != nil || res.Text != "hi" || len(f.seen) != 2 || len(waits) != 1 || waits[0] != 2*time.Second {
+		t.Errorf("res=%+v err=%v requests=%d waits=%v", res, err, len(f.seen), waits)
+	}
+}
+
+func TestAKeyUsedWithAnotherRequestIsReportedNotRetried(t *testing.T) {
+	f, c := newFake(t, fail(422, "IDEMPOTENCY_KEY_REUSED", "used with a different request"))
+	_, err := c.Voice.PlaceCall(WithIdempotencyKey(ctx, "visit-77"), aCall)
+	var apiErr *Error
+	if !errors.As(err, &apiErr) || apiErr.Status != 422 || apiErr.Code != "IDEMPOTENCY_KEY_REUSED" || len(f.seen) != 1 {
+		t.Errorf("err=%v requests=%d", err, len(f.seen))
+	}
+}
+
+// A key on the context of a read, or of a write that takes none, is not sent.
+func TestAKeyIsOnlySentWhereTheRouteTakesOne(t *testing.T) {
+	f, c := newFake(t, ok(`{}`))
+	keyed := WithIdempotencyKey(ctx, "k1")
+	_, _ = c.Whoami(keyed)
+	_, _ = c.Customers.Update(keyed, "c1", map[string]any{"tier": "gold"})
+	_, _ = c.Conversations.PostMessage(ctx, "s1", []Block{{"type": "text", "markdown": "hi"}})
+	for _, s := range f.seen {
+		if s.key != "" {
+			t.Errorf("%s %s carried a key", s.method, s.path)
+		}
+	}
+
+	f.seen = nil
+	_, _ = c.Knowledge.CreateDocument(keyed, DocumentInput{Title: "t", Content: "c"})
+	_, _ = c.Knowledge.ImportFile(keyed, []byte{1}, "a.pdf", "application/pdf", "")
+	_, _ = c.Knowledge.CreateSource(keyed, SourceInput{RootURL: "https://x.test"})
+	_ = c.Knowledge.CrawlSource(keyed, "c1", "")
+	_, _ = c.Agent.Turn(keyed, AgentTurnRequest{Message: "hi"})
+	_, _ = c.Voice.PlaceCall(keyed, aCall)
+	_, _ = c.Voice.CreateJob(keyed, VoiceJobRequest{Kind: "transcribe", SourceURL: "https://x.test/a.mp3"})
+	_, _ = c.Conversations.PostMessage(keyed, "s1", []Block{{"type": "text", "markdown": "hi"}})
+	_, _ = c.Channels.LinkedInPublish(keyed, "hi", "")
+	if len(f.seen) != len(idempotent) {
+		t.Fatalf("requests = %d, want %d", len(f.seen), len(idempotent))
+	}
+	for _, s := range f.seen {
+		if s.key != "k1" {
+			t.Errorf("%s %s did not carry the key", s.method, s.path)
+		}
+	}
+}
+
+func TestAVoiceJobNamesItsAppInTheQuery(t *testing.T) {
+	f, c := newFake(t, ok(`{"id":"j1"}`))
+	c.app = "nordwell"
+	if _, err := c.Voice.CreateJob(ctx, VoiceJobRequest{Kind: "transcribe", SourceURL: "https://x.test/a.mp3"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.seen[0].path, "app=nordwell") || strings.Contains(f.seen[0].body, "app") {
+		t.Errorf("path=%s body=%s", f.seen[0].path, f.seen[0].body)
 	}
 }

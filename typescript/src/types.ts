@@ -201,6 +201,8 @@ export interface Plan {
   rate_per_minute: number
   /** AI turns used and included this period. A limit of -1 is not capped. */
   ai_turns?: { used: number; limit: number; resets_at: string }
+  /** Voice minutes used and included this period. Speech, voice jobs and calls draw on them. */
+  voice_minutes?: { used: number; limit: number; resets_at: string }
 }
 
 export interface CallRequest {

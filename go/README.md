@@ -5,7 +5,7 @@ Go client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/). S
 ## Install
 
 ```sh
-go get github.com/omazyai/omazy-sdk/go@v0.2.0
+go get github.com/omazyai/omazy-sdk/go@v0.3.0
 ```
 
 ```go
@@ -58,6 +58,23 @@ res, err := c.AI.Stream(ctx, req, func(text string) { fmt.Print(text) })
 ```
 
 `res` is the full result once the stream is done.
+
+## Sending a request again
+
+A read is retried for you. A request that changes something is not: placing a call, posting a message, publishing, running an agent turn and adding knowledge are sent once. Give one a key and it becomes safe to repeat. The platform runs it once and answers a repeat with the first answer, so the client retries it like a read.
+
+```go
+ctx := omazy.WithIdempotencyKey(ctx, orderID) // or a new UUID, kept with the order
+
+res, err := c.Voice.PlaceCall(ctx, omazy.CallRequest{
+	To: "+447700900123", Purpose: "confirmation", ConsentBasis: "transaction",
+	Opening: "Hello, this is Nordwell.",
+})
+```
+
+Use a new key for each new request, and the same key when you send one again, also from another process or after a restart. A successful answer is remembered for 24 hours. A failed request is not remembered. The same key with a different request is refused with `IDEMPOTENCY_KEY_REUSED`. `c.Last().Replayed` is true when the answer was a remembered one.
+
+The calls that read the key: `Knowledge.CreateDocument`, `Knowledge.ImportFile`, `Knowledge.CreateSource`, `Knowledge.CrawlSource`, `Agent.Turn`, `Voice.PlaceCall`, `Voice.CreateJob`, `Conversations.PostMessage` and `Channels.LinkedInPublish`. On any other call a key on the context is ignored.
 
 ## Errors
 

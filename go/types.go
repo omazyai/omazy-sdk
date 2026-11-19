@@ -261,6 +261,9 @@ type Plan struct {
 	RatePerMinute int `json:"rate_per_minute"`
 	// AITurns is the AI turns used and included this period.
 	AITurns *Allowance `json:"ai_turns,omitempty"`
+	// VoiceMinutes is the voice minutes used and included this period. Speech,
+	// voice jobs and calls draw on them.
+	VoiceMinutes *Allowance `json:"voice_minutes,omitempty"`
 }
 
 // Allowance is where a workspace stands against one monthly plan limit. A

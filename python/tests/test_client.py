@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from omazy import RETRYABLE, ROUTES, Omazy, OmazyError, sign, verify_signature  # noqa: E402
+from omazy import IDEMPOTENT, RETRYABLE, ROUTES, Omazy, OmazyError, sign, verify_signature  # noqa: E402
 
 # hmac-sha256('s3cret', '{"a":1}') in hex, computed with openssl. The three SDKs
 # test against the same vector.
@@ -261,6 +261,71 @@ class RetryTest(Base):
             o.whoami()
         self.assertEqual((cm.exception.status, cm.exception.code), (0, "NETWORK_ERROR"))
         self.assertEqual(len(self.slept), 1)
+
+
+def header(seen, name):
+    """A request header by name, whatever case it was sent in."""
+    return next((v for k, v in seen["headers"].items() if k.lower() == name.lower()), None)
+
+
+class IdempotencyTest(Base):
+    def test_the_routes_that_take_a_key_are_the_ones_the_contract_marks(self):
+        contract = json.loads(CONTRACT.read_text())
+        want = {r["sdk"] for r in contract["routes"] if r.get("idempotency_key")}
+        self.assertEqual(set(IDEMPOTENT), want)
+        self.assertFalse(IDEMPOTENT & RETRYABLE)
+
+    def test_a_call_placed_with_a_key_is_sent_again_with_the_same_key(self):
+        self.api.answers = [fail(503, "UPSTREAM_UNAVAILABLE", "busy"), ok({"ref": "r1"}, **{"Idempotent-Replayed": "true"})]
+        o = self.client()
+        res = o.voice.calls.place("+8801712345678", "reminder", "customer", idempotency_key="visit-77")
+        self.assertEqual(res["ref"], "r1")
+        self.assertEqual([header(s, "Idempotency-Key") for s in self.api.seen], ["visit-77", "visit-77"])
+        self.assertTrue(o.last.replayed)
+        # The key travels in the header and never in the body.
+        self.assertNotIn("idempotency_key", json.loads(self.api.seen[0]["body"]))
+
+    def test_a_repeat_while_the_first_still_runs_waits_and_asks_again(self):
+        self.api.answers = [fail(409, "IDEMPOTENCY_IN_PROGRESS", "still running", **{"Retry-After": "2"}), ok({"text": "hi"})]
+        self.assertEqual(self.client().agent.turn("hi", idempotency_key="turn-1")["text"], "hi")
+        self.assertEqual((len(self.api.seen), self.slept), (2, [2]))
+
+    def test_a_key_used_with_another_request_is_reported_not_retried(self):
+        self.api.answers = [fail(422, "IDEMPOTENCY_KEY_REUSED", "used with a different request")]
+        with self.assertRaises(OmazyError) as cm:
+            self.client().voice.calls.place("+8801712345678", "reminder", "customer", idempotency_key="visit-77")
+        self.assertEqual((cm.exception.status, cm.exception.code), (422, "IDEMPOTENCY_KEY_REUSED"))
+        self.assertEqual(len(self.api.seen), 1)
+
+    def test_without_a_key_nothing_is_added_and_nothing_is_repeated(self):
+        self.api.answers = [fail(409, "IDEMPOTENCY_IN_PROGRESS", "still running")]
+        with self.assertRaises(OmazyError):
+            self.client().conversations.post_message("s1", [{"type": "text", "markdown": "hi"}])
+        self.assertEqual(len(self.api.seen), 1)
+        self.assertIsNone(header(self.api.seen[0], "Idempotency-Key"))
+
+    def test_every_route_that_takes_a_key_sends_it(self):
+        self.api.answers = [ok({})]
+        o = self.client()
+        k = {"idempotency_key": "k1"}
+        o.knowledge.documents.create("t", "c", **k)
+        o.knowledge.import_file(b"\x01", "a.pdf", **k)
+        o.knowledge.sources.create("https://x.test", **k)
+        o.knowledge.sources.crawl("c1", **k)
+        o.agent.turn("hi", **k)
+        o.voice.calls.place("+8801712345678", "reminder", "customer", **k)
+        o.voice.jobs.create("transcribe", source_url="https://x.test/a.mp3", **k)
+        o.conversations.post_message("s1", [{"type": "text", "markdown": "hi"}], **k)
+        o.channels.linkedin_publish("hi", **k)
+        self.assertEqual(len(self.api.seen), len(IDEMPOTENT))
+        for s in self.api.seen:
+            self.assertEqual(header(s, "Idempotency-Key"), "k1", s["path"])
+
+    def test_a_voice_job_names_its_app_in_the_query(self):
+        self.api.answers = [ok({"id": "j1"})]
+        self.client(app="nordwell").voice.jobs.create("transcribe", source_url="https://x.test/a.mp3")
+        self.assertIn("app=nordwell", self.api.seen[0]["path"])
+        self.assertEqual(json.loads(self.api.seen[0]["body"]), {"kind": "transcribe", "source_url": "https://x.test/a.mp3"})
 
 
 class StreamTest(Base):

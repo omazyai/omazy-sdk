@@ -36,7 +36,8 @@ ROUTES = {
 # Routes that are safe to send again after a 429, a gateway error or a dropped
 # connection: they read, or they compute an answer and change nothing. Placing a
 # call, posting a message, publishing, running an agent turn (which may fire a
-# tool) and writing knowledge are never retried by the client.
+# tool) and writing knowledge are never retried by the client, unless the
+# caller gives the request an idempotency key (IDEMPOTENT below).
 RETRYABLE = frozenset(
     {
         "whoami",
@@ -51,5 +52,22 @@ RETRYABLE = frozenset(
         "voice.calls.get",
         "voice.jobs.get",
         "customers.get",
+    }
+)
+
+# Routes that take an Idempotency-Key. Each one changes something every time it
+# runs, so the client never repeats it on its own. Given a key, it does: the
+# platform runs the request once and answers a repeat with the first answer.
+IDEMPOTENT = frozenset(
+    {
+        "knowledge.documents.create",
+        "knowledge.import_file",
+        "knowledge.sources.create",
+        "knowledge.sources.crawl",
+        "agent.turn",
+        "voice.calls.place",
+        "voice.jobs.create",
+        "conversations.post_message",
+        "channels.linkedin_publish",
     }
 )

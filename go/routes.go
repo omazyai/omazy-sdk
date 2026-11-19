@@ -41,7 +41,8 @@ var routes = map[string]route{
 // gateway error or a dropped connection: they read, or they compute an answer
 // and change nothing. Placing a call, posting a message, publishing, running an
 // agent turn (which may fire a tool) and writing knowledge are never retried by
-// the client.
+// the client, unless the caller gives the request an idempotency key
+// (idempotent below).
 var retryable = map[string]bool{
 	"whoami":                   true,
 	"ai.complete":              true,
@@ -55,4 +56,20 @@ var retryable = map[string]bool{
 	"voice.calls.get":          true,
 	"voice.jobs.get":           true,
 	"customers.get":            true,
+}
+
+// idempotent lists the routes that take an Idempotency-Key. Each one changes
+// something every time it runs, so the client never repeats it on its own.
+// Given a key (WithIdempotencyKey), it does: the platform runs the request
+// once and answers a repeat with the first answer.
+var idempotent = map[string]bool{
+	"knowledge.documents.create": true,
+	"knowledge.import_file":      true,
+	"knowledge.sources.create":   true,
+	"knowledge.sources.crawl":    true,
+	"agent.turn":                 true,
+	"voice.calls.place":          true,
+	"voice.jobs.create":          true,
+	"conversations.post_message": true,
+	"channels.linkedin_publish":  true,
 }
