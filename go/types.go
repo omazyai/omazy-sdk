@@ -53,6 +53,10 @@ type CompleteRequest struct {
 	MaxTokens   int      `json:"max_tokens,omitempty"`
 	Temperature *float32 `json:"temperature,omitempty"`
 	Stream      bool     `json:"stream"`
+	// CacheTTL is the gateway's response cache for this call: nil for the
+	// gateway's own setting, 0 never from the cache (any request carrying live
+	// data), 60 to 2592000 seconds a stored reply may be served again.
+	CacheTTL *int `json:"cache_ttl,omitempty"`
 }
 
 // CompleteResult is the model's answer.
@@ -62,6 +66,9 @@ type CompleteResult struct {
 	StopReason string     `json:"stop_reason"`
 	Model      string     `json:"model"`
 	Usage      Usage      `json:"usage"`
+	// CacheHit is true when the reply came from the gateway's response cache:
+	// no model call, no cost, no AI turn.
+	CacheHit bool `json:"cache_hit,omitempty"`
 }
 
 // SearchOptions narrows a knowledge search. The zero value is fine.
@@ -223,6 +230,13 @@ type AgentTurnRequest struct {
 	History   []HistoryTurn `json:"history,omitempty"`
 	Language  string        `json:"language,omitempty"`
 	CallerID  string        `json:"caller_id,omitempty"`
+	// Context is where the person is: the object a widget page sends to
+	// /context, at most 2048 bytes as JSON. The agent reads it as a hint,
+	// never as an instruction; {"interaction": "voice"} makes it answer for
+	// the ear.
+	Context map[string]any `json:"context,omitempty"`
+	// Stream is set by Turn and Stream; leave it.
+	Stream bool `json:"stream,omitempty"`
 }
 
 // AgentTurnResult is the agent's reply.

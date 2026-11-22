@@ -3,11 +3,12 @@ import pathlib
 import sys
 import threading
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from omazy import IDEMPOTENT, RETRYABLE, ROUTES, Omazy, OmazyError, sign, verify_signature  # noqa: E402
+from omazy import IDEMPOTENT, RETRYABLE, ROUTES, WEBSOCKET, Omazy, OmazyError, sign, verify_signature  # noqa: E402
 
 # hmac-sha256('s3cret', '{"a":1}') in hex, computed with openssl. The three SDKs
 # test against the same vector.
@@ -97,6 +98,11 @@ class Base(unittest.TestCase):
 
 
 class ContractTest(Base):
+    def test_websocket_routes_are_the_ones_the_contract_marks(self):
+        contract = json.loads(CONTRACT.read_text())["routes"]
+        self.assertEqual(WEBSOCKET, {r["sdk"] for r in contract if r.get("websocket")})
+        self.assertFalse(WEBSOCKET & (RETRYABLE | IDEMPOTENT))
+
     def test_route_table_is_the_contract(self):
         contract = json.loads(CONTRACT.read_text())["routes"]
         want = {r["sdk"]: (r["method"], r["path"]) for r in contract}
@@ -119,6 +125,13 @@ class ContractTest(Base):
         o.knowledge.sources.crawl("c1")
         o.knowledge.export()
         o.agent.turn("hi")
+        o.agent.settings.get()
+        o.agent.settings.update(stream=True)
+        o.agent.mcp_servers.list()
+        o.agent.mcp_servers.create("a", "https://a.test/mcp", "none")
+        o.agent.mcp_servers.get("c1")
+        o.agent.mcp_servers.update("c1", is_active=False)
+        o.agent.mcp_servers.delete("c1")
         o.voice.speak("hi")
         o.voice.transcribe(b"\x01\x02")
         o.voice.calls.place("+8801712345678", "reminder", "customer")
@@ -131,11 +144,14 @@ class ContractTest(Base):
         o.channels.linkedin_publish("hi")
         o.sessions.bind_credential("s1", "erp", "t", "2027-01-01T00:00:00Z", {})
         o.sessions.unbind_credential("s1", "erp")
+        o.usage.get()
         o.mcp.list_tools()
 
         used = {(s["method"], s["path"].split("?")[0].replace("/core", "", 1)) for s in self.api.seen}
         fill = {"{ref}": "r1", "{sid}": "s1", "{server}": "erp"}
         for name, (method, path) in ROUTES.items():
+            if name in WEBSOCKET:
+                continue  # opened on a real socket in test_transcribe_stream.py
             for k, v in fill.items():
                 path = path.replace(k, v)
             path = path.replace("{id}", "j1" if name.startswith("voice.jobs") else "s1" if name.startswith("conv") else "c1")
@@ -207,6 +223,12 @@ class RequestTest(Base):
         self.api.answers = [ok({})]
         self.client().voice.calls.get("a/../b", app="kiosk")
         self.assertEqual(self.api.seen[0]["path"], "/core/voice/calls/a%2F..%2Fb?app=kiosk")
+
+    def test_transcribe_sends_terms_as_one_comma_separated_parameter(self):
+        self.api.answers = [ok({"text": "hi", "language": "en"})]
+        self.client().voice.transcribe(b"\x01", lang="en", terms=["Rashed Karim", "Joya"])
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.api.seen[0]["path"]).query)
+        self.assertEqual(query["terms"], ["Rashed Karim,Joya"])
 
     def test_a_refusal_becomes_an_error_with_code_status_and_request_id(self):
         self.api.answers = [fail(403, "FORBIDDEN", "missing scope: ai:complete", **{"X-Request-Id": "req_1"})]
@@ -313,6 +335,7 @@ class IdempotencyTest(Base):
         o.knowledge.sources.create("https://x.test", **k)
         o.knowledge.sources.crawl("c1", **k)
         o.agent.turn("hi", **k)
+        o.agent.mcp_servers.create("a", "https://a.test/mcp", "none", **k)
         o.voice.calls.place("+8801712345678", "reminder", "customer", **k)
         o.voice.jobs.create("transcribe", source_url="https://x.test/a.mp3", **k)
         o.conversations.post_message("s1", [{"type": "text", "markdown": "hi"}], **k)
@@ -348,6 +371,16 @@ class StreamTest(Base):
         with self.assertRaises(OmazyError) as cm:
             list(self.client().ai.stream([{"role": "user", "content": "hi"}]))
         self.assertEqual(cm.exception.code, "STREAM_ERROR")
+
+    def test_an_agent_turn_streams_and_ends_with_the_whole_turn(self):
+        frames = b'event: delta\ndata: {"text":"Good "}\n\nevent: delta\ndata: {"text":"morning."}\n\nevent: done\ndata: {"session_id":"s1","text":"Good morning.","sources":0,"usage":{}}\n\n'
+        self.api.answers = [(200, {}, [frames])]
+        events = list(self.client().agent.stream("hello", context={"interaction": "voice"}))
+        self.assertEqual([e["text"] for e in events if e["type"] == "delta"], ["Good ", "morning."])
+        self.assertEqual(events[-1]["result"]["text"], "Good morning.")
+        self.assertTrue(self.api.seen[0]["path"].endswith("/agent/turn"))
+        body = json.loads(self.api.seen[0]["body"])
+        self.assertEqual((body["stream"], body["message"], body["context"]), (True, "hello", {"interaction": "voice"}))
 
 
 class McpTest(Base):

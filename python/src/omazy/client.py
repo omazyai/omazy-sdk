@@ -11,11 +11,26 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from .errors import OmazyError
 from .routes import IDEMPOTENT, RETRYABLE, ROUTES
+from .stt import TranscriptionSession, open_transcription
 
 DEFAULT_BASE_URL = "https://mw.omazy.ai/api/v1/core"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 Json = Dict[str, Any]
+
+
+class _Unset:
+    """The value of a setting the caller did not name. ``None`` cannot do that
+    job in ``agent.settings.update``: there it means "back to what the agent
+    inherits"."""
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+#: Leave a setting as it is. The default of every argument of
+#: ``agent.settings.update``.
+UNSET: Any = _Unset()
 
 
 @dataclass
@@ -107,6 +122,7 @@ class Omazy:
         self.conversations = _Conversations(self)
         self.channels = _Channels(self)
         self.sessions = _Sessions(self)
+        self.usage = _Usage(self)
         self.mcp = McpClient(self)
 
     def whoami(self) -> Json:
@@ -139,11 +155,7 @@ class Omazy:
         idempotency_key: Optional[str] = None,
     ) -> _Response:
         method, template = ROUTES[route]
-        url_path = template
-        for k, v in (path or {}).items():
-            url_path = url_path.replace("{" + k + "}", urllib.parse.quote(str(v), safe=""))
-        q = {k: v for k, v in (query or {}).items() if v}
-        url = self._base + url_path + ("?" + urllib.parse.urlencode(q) if q else "")
+        url = _build_url(self._base, template, path, query)
 
         hdrs = {"Authorization": "Bearer " + self._token, "User-Agent": "omazy-sdk-python/" + VERSION}
         data: Optional[bytes] = raw
@@ -157,35 +169,60 @@ class Omazy:
             hdrs["Idempotency-Key"] = str(idempotency_key)
 
         attempts = (self._max_retries if retries is None else retries) if (route in RETRYABLE or keyed) else 0
-        attempt = 0
-        while True:
-            req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-            try:
-                resp = self._open(req, timeout=self._timeout)
-                self.last = _info(resp.headers)
-                return _Response(resp.status, resp.headers, resp)
-            except urllib.error.HTTPError as e:
-                self.last = _info(e.headers)
-                retry_after = _int(e.headers.get("Retry-After"))
-                code, message = _read_error(e)
-                e.close()
-                # 409 with a key: the first request is still running. Wait and ask again.
-                transient = e.code in (429, 502, 503, 504) or (
-                    keyed and e.code == 409 and code == "IDEMPOTENCY_IN_PROGRESS"
-                )
-                # A long Retry-After means the window is full. Waiting it out
-                # here would hide a stalled caller, so hand that back.
-                if transient and attempt < attempts and (retry_after or 0) <= 30:
-                    self._sleep(retry_after if retry_after else _backoff(attempt))
-                    attempt += 1
-                    continue
-                raise OmazyError(message, e.code, code, self.last.request_id, retry_after) from None
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-                if attempt < attempts:
-                    self._sleep(_backoff(attempt))
-                    attempt += 1
-                    continue
-                raise OmazyError(f"no response from the Core API: {e}", 0, "NETWORK_ERROR") from None
+        return _request(self, method, url, data, hdrs, attempts, keyed, "the Core API")
+
+
+def _request(
+    client: Any,
+    method: str,
+    url: str,
+    data: Optional[bytes],
+    headers: Mapping[str, str],
+    attempts: int,
+    keyed: bool,
+    api: str,
+) -> _Response:
+    """Sends one request with retries, for a client that has ``_open``,
+    ``_sleep``, ``_timeout`` and ``last``. Returns the open 2xx response and
+    raises OmazyError otherwise."""
+    attempt = 0
+    while True:
+        req = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
+        try:
+            resp = client._open(req, timeout=client._timeout)
+            client.last = _info(resp.headers)
+            return _Response(resp.status, resp.headers, resp)
+        except urllib.error.HTTPError as e:
+            client.last = _info(e.headers)
+            retry_after = _int(e.headers.get("Retry-After"))
+            code, message = _read_error(e)
+            e.close()
+            # 409 with a key: the first request is still running. Wait and ask again.
+            transient = e.code in (429, 502, 503, 504) or (
+                keyed and e.code == 409 and code == "IDEMPOTENCY_IN_PROGRESS"
+            )
+            # A long Retry-After means the window is full. Waiting it out
+            # here would hide a stalled caller, so hand that back.
+            if transient and attempt < attempts and (retry_after or 0) <= 30:
+                client._sleep(retry_after if retry_after else _backoff(attempt))
+                attempt += 1
+                continue
+            raise OmazyError(message, e.code, code, client.last.request_id, retry_after) from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if attempt < attempts:
+                client._sleep(_backoff(attempt))
+                attempt += 1
+                continue
+            raise OmazyError(f"no response from {api}: {e}", 0, "NETWORK_ERROR") from None
+
+
+def _build_url(base: str, template: str, path: Optional[Mapping[str, str]], query: Optional[Mapping[str, Optional[str]]]) -> str:
+    """Fills ``{name}`` parts of a path and appends the query. Empty values are left out."""
+    url_path = template
+    for k, v in (path or {}).items():
+        url_path = url_path.replace("{" + k + "}", urllib.parse.quote(str(v), safe=""))
+    q = {k: v for k, v in (query or {}).items() if v}
+    return base + url_path + ("?" + urllib.parse.urlencode(q) if q else "")
 
 
 def _backoff(attempt: int) -> float:
@@ -246,8 +283,11 @@ class _AI:
 
         Options: ``system``, ``tools``, ``tool_choice``, ``model`` (with its
         provider, such as ``openai/gpt-4o-mini``), ``profile``, ``max_tokens``,
-        ``temperature``. Returns ``text``, ``tool_calls``, ``stop_reason``,
-        ``model`` and ``usage``.
+        ``temperature``, ``cache_ttl`` (the gateway's response cache: 0 never
+        answers from it, 60 to 2592000 bounds in seconds how long a stored reply
+        may be served again). Returns ``text``, ``tool_calls``, ``stop_reason``,
+        ``model``, ``usage``, and ``cache_hit`` when the reply came from the
+        cache.
         """
         body = self._c._with_app({"messages": messages, **options, "stream": False}, app)
         return self._c._json("ai.complete", body=body)
@@ -260,21 +300,26 @@ class _AI:
         reports an error or ends before ``done``. A stream is not retried.
         """
         body = self._c._with_app({"messages": messages, **options, "stream": True}, app)
-        res = self._c._send("ai.complete", body=body, headers={"Accept": "text/event-stream"}, retries=0)
-        request_id = self._c.last.request_id
-        try:
-            for event, data in read_sse(iter(res.raw.readline, b"")):
-                if event == "delta":
-                    yield {"type": "delta", "text": json.loads(data).get("text", "")}
-                elif event == "done":
-                    yield {"type": "done", "result": json.loads(data)}
-                    return
-                elif event == "error":
-                    e = json.loads(data)
-                    raise OmazyError(e.get("message") or "the stream failed", res.status, e.get("code") or "STREAM_ERROR", request_id)
-        finally:
-            res.raw.close()
-        raise OmazyError("the stream ended before it was done", res.status, "STREAM_ERROR", request_id)
+        return _stream_events(self._c, "ai.complete", body)
+
+
+def _stream_events(c: "Omazy", route: str, body: Json) -> Iterator[Json]:
+    """Reads a streamed route's server-sent events: ``delta``, then ``done`` or ``error``."""
+    res = c._send(route, body=body, headers={"Accept": "text/event-stream"}, retries=0)
+    request_id = c.last.request_id
+    try:
+        for event, data in read_sse(iter(res.raw.readline, b"")):
+            if event == "delta":
+                yield {"type": "delta", "text": json.loads(data).get("text", "")}
+            elif event == "done":
+                yield {"type": "done", "result": json.loads(data)}
+                return
+            elif event == "error":
+                e = json.loads(data)
+                raise OmazyError(e.get("message") or "the stream failed", res.status, e.get("code") or "STREAM_ERROR", request_id)
+    finally:
+        res.raw.close()
+    raise OmazyError("the stream ended before it was done", res.status, "STREAM_ERROR", request_id)
 
 
 class _Knowledge:
@@ -396,9 +441,95 @@ class _Sources:
         )
 
 
+class _AgentMcpServers:
+    """The MCP tool servers the agent may call. Needs ``agent:tools``.
+
+    This is not ``omazy.mcp``, which is Omazy as an MCP server for your own
+    agent. These are the servers Omazy's agent calls.
+    """
+
+    def __init__(self, c: Omazy) -> None:
+        self._c = c
+
+    def _app(self, app: Optional[str]) -> Optional[str]:
+        return app if app is not None else self._c._app
+
+    def list(self, app: Optional[str] = None) -> List[Json]:
+        """The agent's servers, newest first. A credential is never returned;
+        ``has_credentials`` says whether one is stored."""
+        return self._c._json("agent.mcp_servers.list", query={"app": self._app(app)}) or []
+
+    def get(self, server_id: str, app: Optional[str] = None) -> Json:
+        return self._c._json("agent.mcp_servers.get", path={"id": server_id}, query={"app": self._app(app)})
+
+    def create(
+        self,
+        name: str,
+        endpoint_url: str,
+        auth_type: str,
+        credentials: Optional[str] = None,
+        allowed_tools: Optional[List[str]] = None,
+        is_active: Optional[bool] = None,
+        write_mode: Optional[str] = None,
+        action_policy: Optional[Json] = None,
+        app: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        subject_check: Optional[str] = None,
+    ) -> Json:
+        """Connects a server. Its tools reach the model from the agent's next
+        turn as ``mcp_<name>__<tool>``.
+
+        ``name`` is unique within the app: a second server with it is
+        ``409 CONFLICT``. ``endpoint_url`` must be https on a public host.
+        ``auth_type`` is ``none``, ``bearer``, ``header`` or
+        ``session_bearer``. ``credentials`` is the bearer token, or
+        ``"Header-Name: value"`` for ``header``; it is stored encrypted and
+        never returned. ``write_mode`` defaults to ``confirm``: the visitor
+        agrees on a card before a tool that changes data runs.
+        ``subject_check`` is ``whoami`` (the default) or ``host``: on a
+        ``session_bearer`` server without a ``whoami`` tool, such as Notion's,
+        ``host`` binds each person's token on your backend's word. Retried
+        only with an ``idempotency_key``.
+        """
+        body = self._c._with_app(
+            {
+                "name": name,
+                "endpoint_url": endpoint_url,
+                "auth_type": auth_type,
+                "credentials": credentials,
+                "allowed_tools": allowed_tools,
+                "is_active": is_active,
+                "write_mode": write_mode,
+                "action_policy": action_policy,
+                "subject_check": subject_check,
+            },
+            app,
+        )
+        return self._c._json("agent.mcp_servers.create", body=body, idempotency_key=idempotency_key)
+
+    def update(self, server_id: str, app: Optional[str] = None, **fields: Any) -> Json:
+        """Changes a server. Send only what changes: ``name``,
+        ``endpoint_url``, ``auth_type``, ``credentials``, ``allowed_tools``,
+        ``is_active``, ``write_mode``, ``action_policy``, ``subject_check``.
+        ``credentials=""``
+        removes the stored credential and ``allowed_tools=[]`` allows every
+        tool."""
+        body: Json = dict(fields)
+        chosen = self._app(app)
+        if chosen:
+            body["app"] = chosen
+        return self._c._json("agent.mcp_servers.update", path={"id": server_id}, body=body)
+
+    def delete(self, server_id: str, app: Optional[str] = None) -> Json:
+        """Removes a server and its stored credential. Never sent twice by the client."""
+        return self._c._json("agent.mcp_servers.delete", path={"id": server_id}, query={"app": self._app(app)})
+
+
 class _Agent:
     def __init__(self, c: Omazy) -> None:
         self._c = c
+        self.settings = _AgentSettings(c)
+        self.mcp_servers = _AgentMcpServers(c)
 
     def turn(
         self,
@@ -417,11 +548,94 @@ class _Agent:
         The caller keeps the conversation: pass earlier turns in ``history``
         (``{"role": "user"|"assistant", "text": ...}``, oldest first) and reuse
         the ``session_id`` an earlier turn returned.
+
+        Options: ``caller_id``, and ``context``, where the person is: the
+        dict a widget page sends to ``/context``, at most 2048 bytes as JSON.
+        The agent reads it as a hint, never as an instruction;
+        ``{"interaction": "voice"}`` makes it answer for the ear.
         """
         body = self._c._with_app(
             {"message": message, "history": history, "session_id": session_id, "language": language, **options}, app
         )
         return self._c._json("agent.turn", body=body, idempotency_key=idempotency_key)
+
+    def stream(
+        self,
+        message: str,
+        history: Optional[List[Json]] = None,
+        session_id: Optional[str] = None,
+        language: Optional[str] = None,
+        app: Optional[str] = None,
+        **options: Any,
+    ) -> Iterator[Json]:
+        """The same turn as a stream. Needs ``agent:run``.
+
+        Yields ``{"type": "delta", "text": ...}`` as the reply is written, with
+        the agent's reply markup held back, then one ``{"type": "done",
+        "result": ...}`` with the whole turn. Keep the text from ``done``.
+        When the agent's settings turn streaming off or redaction on, only
+        ``done`` arrives. Raises OmazyError if the stream reports an error or
+        ends before ``done``. A stream is not retried, and an idempotency key
+        does not replay it.
+        """
+        body = self._c._with_app(
+            {"message": message, "history": history, "session_id": session_id, "language": language, **options, "stream": True},
+            app,
+        )
+        return _stream_events(self._c, "agent.turn", body)
+
+
+class _AgentSettings:
+    def __init__(self, c: Omazy) -> None:
+        self._c = c
+
+    def get(self, app: Optional[str] = None) -> Json:
+        """How the agent runs: ``model`` (with ``max_tokens`` and
+        ``temperature``), ``models`` the plan allows, and the ``loop``
+        switches. Needs ``agent:configure``."""
+        return self._c._json("agent.settings.get", query={"app": app if app is not None else self._c._app})
+
+    def update(
+        self,
+        model: Any = UNSET,
+        max_tokens: Any = UNSET,
+        temperature: Any = UNSET,
+        harness: Any = UNSET,
+        stream: Any = UNSET,
+        redact: Any = UNSET,
+        app: Optional[str] = None,
+        memory: Any = UNSET,
+        files: Any = UNSET,
+    ) -> Json:
+        """Changes the agent's settings and returns them after the change.
+        Needs ``agent:configure``.
+
+        An argument left out is left as it is. ``None`` puts a setting back to
+        what the agent inherits: ``model=None`` removes the agent's own
+        binding, and ``max_tokens`` and ``temperature`` go with it.
+
+        A new ``model`` must be one of ``models`` in the settings
+        (``MODEL_NOT_AVAILABLE`` otherwise) and is tested with one real call
+        before it is saved, so allow up to 90 seconds. One that does not answer
+        is ``MODEL_NOT_SERVING`` and nothing changes. Setting ``max_tokens``
+        or ``temperature`` on an agent that inherits its model pins the agent
+        to the model it runs on now.
+
+        ``harness``, ``stream``, ``redact``, ``memory`` and ``files`` are the
+        loop switches (``memory`` gives the agent remember and forget tools,
+        ``files`` a create_file tool): ``True``
+        or ``False`` sets one for this agent, ``None`` puts it back to the
+        platform's default. The same change sent twice leaves the same
+        settings.
+        """
+        body: Json = {k: v for k, v in (("model", model), ("max_tokens", max_tokens), ("temperature", temperature)) if v is not UNSET}
+        loop = {k: v for k, v in (("harness", harness), ("stream", stream), ("redact", redact), ("memory", memory), ("files", files)) if v is not UNSET}
+        if loop:
+            body["loop"] = loop
+        chosen = app if app is not None else self._c._app
+        if chosen:
+            body["app"] = chosen
+        return self._c._json("agent.settings.update", body=body)
 
 
 class _Calls:
@@ -479,14 +693,57 @@ class _Voice:
         res = self._c._send("voice.speak", body=self._c._with_app({"text": text, "lang": lang}, app))
         return res.read(), res.headers.get("X-Omazy-Speech-Lang") or ""
 
-    def transcribe(self, audio: bytes, lang: Optional[str] = None, app: Optional[str] = None, content_type: str = "application/octet-stream") -> Json:
-        """Speech to text. ``audio`` is the raw recording, at most 8 MB. Needs ``voice:speech``."""
+    def transcribe(
+        self,
+        audio: bytes,
+        lang: Optional[str] = None,
+        app: Optional[str] = None,
+        content_type: str = "application/octet-stream",
+        terms: Optional[List[str]] = None,
+    ) -> Json:
+        """Speech to text. ``audio`` is the raw recording, at most 8 MB. ``terms``
+        are names and words to expect, so they come back spelled right. Needs ``voice:speech``."""
         return self._c._json(
             "voice.transcribe",
             raw=audio,
-            query={"lang": lang, "app": app or self._c._app},
+            query={"lang": lang, "app": app or self._c._app, "terms": ",".join(terms) if terms else None},
             headers={"Content-Type": content_type},
         )
+
+    def transcribe_stream(
+        self,
+        language: Optional[str] = None,
+        terms: Optional[List[str]] = None,
+        audio_format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        num_channels: Optional[int] = None,
+        app: Optional[str] = None,
+        on_event: Optional[Callable[[Json], None]] = None,
+    ) -> TranscriptionSession:
+        """Live speech to text over a WebSocket. Needs ``voice:speech``.
+
+        Open it when the person starts speaking (or once for a whole
+        conversation), ``send`` audio as it is captured, ``commit()`` after each
+        utterance and ``end()`` to finish. The text is ready a few hundred
+        milliseconds after they stop. ``audio_format`` is ``auto`` (WebM/Opus,
+        Ogg or WAV, the default), ``pcm_s16le``, ``mulaw`` or ``alaw``; raw
+        audio needs ``sample_rate``. Never retried.
+
+        >>> with omazy.voice.transcribe_stream(language="bn", terms=["Rashed Karim"],
+        ...                                    audio_format="pcm_s16le", sample_rate=16000) as s:
+        ...     for chunk in mic: s.send(chunk)
+        ...     print(s.end()["text"])
+        """
+        c = self._c
+        _, template = ROUTES["voice.transcribe_stream"]
+        query = urllib.parse.urlencode({"app": app or c._app} if (app or c._app) else {})
+        url = c._base.replace("http", "ws", 1) + template + (f"?{query}" if query else "")
+        start = _drop_none(
+            {"type": "start", "language": language, "terms": terms, "audio_format": audio_format,
+             "sample_rate": sample_rate, "num_channels": num_channels}
+        )
+        headers = {"Authorization": f"Bearer {c._token}", "User-Agent": f"omazy-sdk-python/{VERSION}"}
+        return open_transcription(url, headers, start, c._timeout, on_event)
 
 
 class _Customers:
@@ -500,6 +757,22 @@ class _Customers:
     def update(self, customer_id: str, custom_fields: Json) -> Json:
         """Merge keys into a customer's custom fields. Needs ``memory:write``."""
         return self._c._json("customers.update", path={"id": customer_id}, body={"custom_fields": custom_fields})
+
+
+class _Usage:
+    def __init__(self, c: Omazy) -> None:
+        self._c = c
+
+    def get(self, from_: Optional[str] = None, to: Optional[str] = None) -> Json:
+        """What the workspace used and what it cost, per UTC day. Needs ``usage:read``.
+
+        ``from_`` and ``to`` are days as ``YYYY-MM-DD``, both included; the
+        last 30 days by default, at most 90. The answer has ``totals`` and
+        ``days``: model calls, cache hits, tokens, speech, cost in
+        ``cost_micros``, and the plan's counters (conversations, AI turns,
+        API calls, voice minutes).
+        """
+        return self._c._json("usage.get", query={"from": from_, "to": to})
 
 
 class _Conversations:

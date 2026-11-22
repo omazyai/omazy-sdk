@@ -27,19 +27,19 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.3.0/omazyai-sdk-0.3.0.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.4.0/omazyai-sdk-0.4.0.tgz
 ```
 
 **Python.**
 
 ```sh
-pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.3.0/omazy-0.3.0-py3-none-any.whl
+pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.4.0/omazy-0.4.0-py3-none-any.whl
 ```
 
 **Go.**
 
 ```sh
-go get github.com/omazyai/omazy-sdk/go@v0.3.0
+go get github.com/omazyai/omazy-sdk/go@v0.4.0
 ```
 
 ## Your account and your token
@@ -121,9 +121,41 @@ The workspace's plan decides how much a token may do. Three numbers matter, and 
 
 Details: [Errors and limits](https://docs.omazy.ai/reference/core-api/errors-and-limits/).
 
+## One workspace per customer
+
+A product that serves many customers gives each of them a workspace of their own: their knowledge, their agent, their conversations and their usage, apart from every other customer's. The Enterprise API creates and runs those workspaces, and each client has a second entry point for it.
+
+| | Core API | Enterprise API |
+|---|---|---|
+| Key | An install token, `cai_...`, one per workspace | An account key, `eak_...`, one per product |
+| Does | Models, knowledge, the agent, speech and calls of one workspace | Creates, lists, suspends and closes workspaces, and rotates their install tokens |
+| Client | `Omazy` | `OmazyEnterprise` (`NewEnterprise` in Go) |
+
+```ts
+import { OmazyEnterprise } from '@omazyai/sdk'
+
+const account = new OmazyEnterprise({ token: process.env.OMAZY_ACCOUNT_KEY! })
+
+// Once per customer. Safe to repeat: your own id names the workspace.
+const { workspace, token } = await account.workspaces.create({ external_id: 'cust_42', name: 'Acme Bank' })
+if (token) await saveTokenFor('cust_42', token) // shown once
+
+// From then on, work as that customer.
+const acme = account.core(await tokenFor('cust_42'))
+await acme.knowledge.documents.create({ title: 'Opening hours', content: '9 to 5, Sunday to Thursday.' })
+const { text } = await acme.agent.turn({ message: 'When are you open?' })
+```
+
+Things to know:
+
+- **The token is shown once.** `create` returns the customer's install token on the call that made it and never again. Store it then. If it is lost, `rotateInstall` gives a new one.
+- **An account key cannot call a model.** It manages workspaces. Each customer's own token does the work, so usage and limits are counted per customer.
+- **Suspending takes up to 30 seconds** to reach the Core API. Closing a workspace erases nothing; `resume` reopens it.
+- **An account key is issued by Omazy** to a product. There is no self-serve way to get one yet.
+
 ## One contract
 
-[`contracts/core-api.routes.json`](contracts/core-api.routes.json) lists every Core API route with its scope, its SDK method and its MCP tool. The API's own tests and each SDK's tests are held to it, so a client cannot drift from the API it calls.
+[`contracts/core-api.routes.json`](contracts/core-api.routes.json) lists every Core API route with its scope, its SDK method and its MCP tool, and [`contracts/enterprise-api.routes.json`](contracts/enterprise-api.routes.json) does the same for the Enterprise API. The API's own tests and each SDK's tests are held to them, so a client cannot drift from the API it calls.
 
 ```sh
 cd typescript && npm install && npm run check

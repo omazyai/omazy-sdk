@@ -31,7 +31,7 @@ const (
 	// DefaultBaseURL is the production Core API.
 	DefaultBaseURL = "https://mw.omazy.ai/api/v1/core"
 	// Version of this client.
-	Version = "0.3.0"
+	Version = "0.4.0"
 )
 
 // Error is a refusal or failure from the Core API. Branch on Code, log Message.
@@ -85,6 +85,7 @@ type Client struct {
 	Conversations *ConversationsService
 	Channels      *ChannelsService
 	Sessions      *SessionsService
+	Usage         *UsageService
 	MCP           *MCPService
 }
 
@@ -128,6 +129,7 @@ func New(token string, opts ...Option) *Client {
 	c.AI, c.Knowledge, c.Agent = &AIService{c}, &KnowledgeService{c}, &AgentService{c}
 	c.Voice, c.Customers, c.Conversations = &VoiceService{c}, &CustomersService{c}, &ConversationsService{c}
 	c.Channels, c.Sessions, c.MCP = &ChannelsService{c}, &SessionsService{c}, &MCPService{c: c}
+	c.Usage = &UsageService{c}
 	return c
 }
 
@@ -204,9 +206,25 @@ func (c *Client) send(ctx context.Context, name string, in call) (*http.Response
 	if !ok {
 		return nil, fmt.Errorf("omazy: unknown route %q", name)
 	}
+	// A key makes a request that changes something safe to send again.
+	key, _ := ctx.Value(idempotencyKey{}).(string)
+	if !idempotent[name] {
+		key = ""
+	}
+	attempts := 0
+	if (retryable[name] || key != "") && !in.noRetry {
+		attempts = c.maxRetries
+	}
+	return c.do(ctx, r, in, attempts, key, "the Core API")
+}
+
+// do sends one request to a route with retries. key, when set, is sent as
+// Idempotency-Key. api names the API in a network error.
+func (c *Client) do(ctx context.Context, r route, in call, attempts int, key, api string) (*http.Response, error) {
 	if c.token == "" {
 		return nil, errors.New("omazy: token is required")
 	}
+	keyed := key != ""
 	path := r.path
 	for k, v := range in.path {
 		path = strings.ReplaceAll(path, "{"+k+"}", url.PathEscape(v))
@@ -228,13 +246,6 @@ func (c *Client) send(ctx context.Context, name string, in call) (*http.Response
 			return nil, err
 		}
 		payload = b
-	}
-	// A key makes a request that changes something safe to send again.
-	key, _ := ctx.Value(idempotencyKey{}).(string)
-	keyed := key != "" && idempotent[name]
-	attempts := 0
-	if (retryable[name] || keyed) && !in.noRetry {
-		attempts = c.maxRetries
 	}
 	for attempt := 0; ; attempt++ {
 		var body io.Reader
@@ -267,7 +278,7 @@ func (c *Client) send(ctx context.Context, name string, in call) (*http.Response
 				}
 				continue
 			}
-			return nil, &Error{Code: "NETWORK_ERROR", Message: "no response from the Core API: " + err.Error()}
+			return nil, &Error{Code: "NETWORK_ERROR", Message: "no response from " + api + ": " + err.Error()}
 		}
 		info := readInfo(res.Header)
 		c.mu.Lock()
@@ -368,16 +379,26 @@ func (s *AIService) Complete(ctx context.Context, req CompleteRequest) (*Complet
 // retried.
 func (s *AIService) Stream(ctx context.Context, req CompleteRequest, onDelta func(text string)) (*CompleteResult, error) {
 	req.Stream, req.App = true, s.c.appOr(req.App)
-	res, err := s.c.send(ctx, "ai.complete", call{body: req, headers: map[string]string{"Accept": "text/event-stream"}, noRetry: true})
-	if err != nil {
+	var out CompleteResult
+	if err := s.c.streamEvents(ctx, "ai.complete", req, onDelta, &out); err != nil {
 		return nil, err
 	}
+	return &out, nil
+}
+
+// streamEvents reads a streamed route's server-sent events: onDelta for each
+// delta frame, then the done frame into out, or the error frame as an *Error.
+func (c *Client) streamEvents(ctx context.Context, route string, body any, onDelta func(text string), out any) error {
+	res, err := c.send(ctx, route, call{body: body, headers: map[string]string{"Accept": "text/event-stream"}, noRetry: true})
+	if err != nil {
+		return err
+	}
 	defer res.Body.Close()
-	requestID := s.c.Last().RequestID
+	requestID := c.Last().RequestID
 	fail := func(code, msg string) *Error {
 		return &Error{Status: res.StatusCode, Code: code, Message: msg, RequestID: requestID}
 	}
-	var out *CompleteResult
+	done := false
 	err = readSSE(res.Body, func(event, data string) (bool, error) {
 		switch event {
 		case "delta":
@@ -391,10 +412,10 @@ func (s *AIService) Stream(ctx context.Context, req CompleteRequest, onDelta fun
 				onDelta(d.Text)
 			}
 		case "done":
-			out = &CompleteResult{}
 			if err := json.Unmarshal([]byte(data), out); err != nil {
 				return false, fail("STREAM_ERROR", "the done frame was not JSON")
 			}
+			done = true
 			return true, nil
 		case "error":
 			var e struct {
@@ -414,18 +435,18 @@ func (s *AIService) Stream(ctx context.Context, req CompleteRequest, onDelta fun
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 		var apiErr *Error
 		if errors.As(err, &apiErr) {
-			return nil, apiErr
+			return apiErr
 		}
-		return nil, fail("STREAM_ERROR", "the stream broke: "+err.Error())
+		return fail("STREAM_ERROR", "the stream broke: "+err.Error())
 	}
-	if out == nil {
-		return nil, fail("STREAM_ERROR", "the stream ended before it was done")
+	if !done {
+		return fail("STREAM_ERROR", "the stream ended before it was done")
 	}
-	return out, nil
+	return nil
 }
 
 // readSSE reads a server-sent event stream, calling fn for each frame until it
@@ -584,9 +605,93 @@ type AgentService struct{ c *Client }
 
 // Turn runs one turn. Needs agent:run. Never retried: a turn may fire a tool.
 func (s *AgentService) Turn(ctx context.Context, req AgentTurnRequest) (*AgentTurnResult, error) {
-	req.App = s.c.appOr(req.App)
+	req.Stream, req.App = false, s.c.appOr(req.App)
 	var out AgentTurnResult
 	return &out, s.c.json(ctx, "agent.turn", call{body: req}, &out)
+}
+
+// Stream runs the same turn as a stream. onDelta is called with each piece of
+// the reply as it is written, with the agent's reply markup held back; the
+// whole turn is returned at the end, and its text is the one to keep. When
+// the agent's settings turn streaming off or redaction on, onDelta is not
+// called. It returns an *Error if the stream reports one or ends before it is
+// done. A stream is not retried, and an idempotency key does not replay it.
+// Needs agent:run.
+func (s *AgentService) Stream(ctx context.Context, req AgentTurnRequest, onDelta func(text string)) (*AgentTurnResult, error) {
+	req.Stream, req.App = true, s.c.appOr(req.App)
+	var out AgentTurnResult
+	if err := s.c.streamEvents(ctx, "agent.turn", req, onDelta, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Settings returns how the agent runs: its model with the reply cap and
+// temperature, the models the plan allows, and the loop switches. app may be
+// empty. Needs agent:configure.
+func (s *AgentService) Settings(ctx context.Context, app string) (*AgentSettings, error) {
+	var out AgentSettings
+	return &out, s.c.json(ctx, "agent.settings.get", call{query: map[string]string{"app": s.c.appOr(app)}}, &out)
+}
+
+// UpdateSettings changes the model, the reply cap, the temperature or the
+// loop switches, and returns the settings after the change. A field left nil
+// is left as it is; Clear puts one back to what the agent inherits.
+//
+// A new model is tested with one real call before it is saved, so allow up to
+// 90 seconds. A model off the plan is MODEL_NOT_AVAILABLE; one that did not
+// answer is MODEL_NOT_SERVING, and nothing changes. The same change sent
+// twice leaves the same settings. Needs agent:configure.
+func (s *AgentService) UpdateSettings(ctx context.Context, req AgentSettingsUpdate) (*AgentSettings, error) {
+	req.App = s.c.appOr(req.App)
+	var out AgentSettings
+	return &out, s.c.json(ctx, "agent.settings.update", call{body: req}, &out)
+}
+
+// ListMCPServers returns the MCP tool servers the agent may call, newest
+// first. A credential is never returned. app may be empty. Needs agent:tools.
+//
+// These are the servers Omazy's agent calls. c.MCP is the other direction:
+// Omazy as an MCP server for your own agent.
+func (s *AgentService) ListMCPServers(ctx context.Context, app string) ([]MCPServer, error) {
+	var out []MCPServer
+	if err := s.c.json(ctx, "agent.mcp_servers.list", call{query: map[string]string{"app": s.c.appOr(app)}}, &out); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []MCPServer{} // an agent with no servers
+	}
+	return out, nil
+}
+
+// GetMCPServer returns one of the agent's MCP servers. Needs agent:tools.
+func (s *AgentService) GetMCPServer(ctx context.Context, id, app string) (*MCPServer, error) {
+	var out MCPServer
+	return &out, s.c.json(ctx, "agent.mcp_servers.get", call{path: map[string]string{"id": id}, query: map[string]string{"app": s.c.appOr(app)}}, &out)
+}
+
+// CreateMCPServer connects a server. Its tools reach the model from the
+// agent's next turn as mcp_<name>__<tool>. The name is unique within the app:
+// a second server with it is 409 CONFLICT. The endpoint must be https on a
+// public host. Retried only with WithIdempotencyKey. Needs agent:tools.
+func (s *AgentService) CreateMCPServer(ctx context.Context, req MCPServerInput) (*MCPServer, error) {
+	req.App = s.c.appOr(req.App)
+	var out MCPServer
+	return &out, s.c.json(ctx, "agent.mcp_servers.create", call{body: req}, &out)
+}
+
+// UpdateMCPServer changes a server. A nil field is left as it is. A pointer
+// to "" in Credentials removes the stored credential. Needs agent:tools.
+func (s *AgentService) UpdateMCPServer(ctx context.Context, id string, req MCPServerUpdate) (*MCPServer, error) {
+	req.App = s.c.appOr(req.App)
+	var out MCPServer
+	return &out, s.c.json(ctx, "agent.mcp_servers.update", call{path: map[string]string{"id": id}, body: req}, &out)
+}
+
+// DeleteMCPServer removes a server and its stored credential. Never sent twice
+// by the client. Needs agent:tools.
+func (s *AgentService) DeleteMCPServer(ctx context.Context, id, app string) error {
+	return s.c.json(ctx, "agent.mcp_servers.delete", call{path: map[string]string{"id": id}, query: map[string]string{"app": s.c.appOr(app)}}, nil)
 }
 
 // VoiceService is speech in both directions, outbound calls and voice tasks.
@@ -611,15 +716,16 @@ func (s *VoiceService) Speak(ctx context.Context, text, lang, app string) (wav [
 	return wav, res.Header.Get("X-Omazy-Speech-Lang"), err
 }
 
-// Transcribe turns a recording (at most 8 MB) into text. Needs voice:speech.
-func (s *VoiceService) Transcribe(ctx context.Context, audio []byte, lang, app string) (text, heard string, err error) {
+// Transcribe turns a recording (at most 8 MB) into text. terms are names and
+// words to expect, so they come back spelled right. Needs voice:speech.
+func (s *VoiceService) Transcribe(ctx context.Context, audio []byte, lang, app string, terms ...string) (text, heard string, err error) {
 	var out struct {
 		Text     string `json:"text"`
 		Language string `json:"language"`
 	}
 	err = s.c.json(ctx, "voice.transcribe", call{
 		raw:     audio,
-		query:   map[string]string{"lang": lang, "app": s.c.appOr(app)},
+		query:   map[string]string{"lang": lang, "app": s.c.appOr(app), "terms": joinTerms(terms)},
 		headers: map[string]string{"Content-Type": "application/octet-stream"},
 	}, &out)
 	return out.Text, out.Language, err

@@ -18,7 +18,7 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.3.0/omazyai-sdk-0.3.0.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.4.0/omazyai-sdk-0.4.0.tgz
 ```
 
 ## Use
@@ -48,8 +48,10 @@ The token is a Core API token (`cai_...`). A workspace owner creates it and choo
 | `knowledge.search(query, opts)` | `kb:search` |
 | `knowledge.documents.list(opts)`, `knowledge.documents.get(id)`, `knowledge.sources.list()`, `knowledge.export(opts)` | `kb:read` |
 | `knowledge.documents.create(doc)`, `.update(id, patch)`, `.delete(id)`, `knowledge.importFile(file, opts)`, `knowledge.sources.create(req)`, `.crawl(id)` | `kb:write` |
-| `agent.turn(req)` | `agent:run` |
-| `voice.speak(text, opts)`, `voice.transcribe(audio, opts)` | `voice:speech` |
+| `agent.turn(req)`, `agent.stream(req)` | `agent:run` |
+| `agent.settings.get(opts)`, `agent.settings.update(change)` | `agent:configure` |
+| `agent.mcpServers.list()`, `.get(id)`, `.create(server)`, `.update(id, change)`, `.delete(id)` | `agent:tools` |
+| `voice.speak(text, opts)`, `voice.transcribe(audio, opts)`, `voice.transcribeStream(opts)` | `voice:speech` |
 | `voice.calls.place(req)`, `voice.calls.get(ref)` | `voice:calls` |
 | `voice.jobs.create(req)`, `voice.jobs.get(id)` | `voice:tasks` |
 | `customers.get(id)` | `core:read` |
@@ -85,6 +87,39 @@ do {
 saved = version // pass it as since next time; leave since out the first time
 ```
 
+## The agent's settings
+
+Read and change how the agent runs: its model, the cap on a reply, the temperature and the loop switches.
+
+```ts
+const settings = await omazy.agent.settings.get()
+settings.model.id          // 'openai/gpt-4o-mini'
+settings.models            // what the plan allows
+
+await omazy.agent.settings.update({ model: 'openai/gpt-4o', max_tokens: 1200 })
+await omazy.agent.settings.update({ loop: { stream: true, redact: null } }) // null: back to the default
+await omazy.agent.settings.update({ model: null })                          // back to the inherited model
+```
+
+A field left out is left as it is. `null` puts it back to what the agent inherits. A new model is tested with one real call before it is saved, so allow up to 90 seconds: `MODEL_NOT_AVAILABLE` is a model off the plan, `MODEL_NOT_SERVING` one that did not answer, and in both cases nothing changes. Setting `max_tokens` or `temperature` on an agent that inherits its model pins it to the model it runs on now.
+
+## The agent's MCP servers
+
+Connect the tool servers the agent may call. This is the other direction from `omazy.mcp`, which is Omazy as an MCP server for your own agent.
+
+```ts
+const server = await omazy.agent.mcpServers.create(
+  { name: 'front-desk', endpoint_url: 'https://tools.example.com/mcp', auth_type: 'bearer', credentials: token },
+  { idempotencyKey: `front-desk-${tenantId}` },
+)
+
+await omazy.agent.mcpServers.update(server.id, { credentials: newToken }) // rotate
+await omazy.agent.mcpServers.update(server.id, { is_active: false })      // keep it, stop calling it
+await omazy.agent.mcpServers.delete(server.id)
+```
+
+The agent offers the server's tools to the model from its next turn, as `mcp_<name>__<tool>`. A name is unique within the app: a second server with it is `409 CONFLICT`. The endpoint must be https on a public host. The credential is stored encrypted and never returned; `has_credentials` says whether one is stored. `write_mode` defaults to `confirm`: the visitor agrees on a card before a tool that changes data runs.
+
 ## Streaming
 
 ```ts
@@ -93,6 +128,28 @@ for await (const ev of omazy.ai.stream({ messages })) {
   else console.log('\n', ev.result.usage)
 }
 ```
+
+An agent turn streams the same way, and `context` tells the agent where the person is:
+
+```ts
+for await (const ev of omazy.agent.stream({ message: 'Is my meeting today?', context: { interaction: 'voice' } })) {
+  if (ev.type === 'delta') speak(ev.text)
+  else history.push({ role: 'assistant', text: ev.result.text })
+}
+```
+
+The agent's own reply markup (quick replies, images) is held back from the pieces. Keep the text of the whole turn at the end: it is the one the agent finished with. When the agent's settings turn streaming off or masking of personal data on, only the whole turn arrives. An agent with connected tools sends its whole reply as one piece for now. A streamed turn is not retried, and an idempotency key does not replay it.
+
+## Live speech to text
+
+```ts
+const s = await omazy.voice.transcribeStream({ language: 'bn', terms: ['Rashed Karim'], audioFormat: 'pcm_s16le', sampleRate: 16000 })
+mic.on('data', (chunk) => s.send(chunk))         // while the button is held
+const { text } = await s.commit()                 // the button is let go
+const done = await s.end()                        // the conversation is over
+```
+
+Open the session when the person starts speaking, or once for a whole conversation, and send audio as it is captured. The vendor session opens while they speak, so the text is ready a few hundred milliseconds after they stop. `commit` after each utterance (a hold-to-talk button let go) returns its final, whose text may be empty; `end` finishes the session and returns every final joined with the audio length it is billed by. Voice minutes are counted once per session, rounded up with a one-minute floor, so hold one session for a conversation rather than one per utterance, and send `keepalive` between utterances: a session silent for 60 seconds is closed. `terms` (at most 200) are names and words to expect; `transcribe` takes them too. The token goes on the upgrade, so this runs on your server: a browser streams to your backend, which relays. A session is never retried. An `error` frame arrives as an error with its `code` and request id. Watch every frame with `onEvent` or `for await (const ev of s.events())`. The default socket works in a Cloudflare Worker, Node 22 and later, Bun and Deno; pass `webSocket` to `new Omazy` for another runtime.
 
 ## Sending a request again
 
@@ -137,6 +194,35 @@ const hit = await omazy.mcp.callTool('knowledge_search', { query: 'opening hours
 // or hand the server to an MCP client of your own
 const server = omazy.mcp.config() // { type: 'http', url, headers }
 ```
+
+## One workspace per customer
+
+For a product that serves many customers. `OmazyEnterprise` takes an account key (`eak_...`) and creates and runs a workspace for each customer. `core(token)` is the client for one of them.
+
+```ts
+import { OmazyEnterprise } from '@omazyai/sdk'
+
+const account = new OmazyEnterprise({ token: process.env.OMAZY_ACCOUNT_KEY! })
+
+const made = await account.workspaces.create({ external_id: 'cust_42', name: 'Acme Bank' })
+if (made.token) await saveTokenFor('cust_42', made.token) // shown once, on the call that minted it
+
+const acme = account.core(await tokenFor('cust_42'))
+await acme.knowledge.documents.create({ title: 'Opening hours', content: '9 to 5' })
+```
+
+| Method | Does | Scope |
+|---|---|---|
+| `account()` | The account, its limits, how many workspaces it manages, and the key | none |
+| `workspaces.create(req)` | The customer's workspace, agent, plan and install. Safe to repeat by `external_id` | `workspaces:manage` (the install needs `installs:manage` too) |
+| `workspaces.list(query)`, `workspaces.all(query)` | One page, or every workspace page by page | `workspaces:manage` |
+| `workspaces.get(id)`, `workspaces.findByExternalId(id)` | One workspace, by its id or by your own | `workspaces:manage` |
+| `workspaces.update(id, req)`, `suspend(id)`, `resume(id)` | Name, brand and status. `resume` also reopens a closed workspace | `workspaces:manage` |
+| `workspaces.close(id)` | Closes it. Nothing is erased | `workspaces:manage` |
+| `workspaces.rotateInstall(id, req)` | A new install token, the old one kept for `overlap_hours` | `installs:manage` |
+| `core(token, options)` | The `Omazy` client for one customer | the customer's token |
+
+Refusals to branch on: `HANDLE_TAKEN` (the message lists free handles), `WORKSPACE_LIMIT_REACHED`, `WORKSPACE_CLOSED` (reopen it with `resume`), `ACCOUNT_SUSPENDED`. Every call except `rotateInstall` is sent again after a 429, a gateway error or a dropped connection.
 
 ## On your own server
 

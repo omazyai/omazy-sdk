@@ -145,6 +145,13 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 	c.Knowledge.CrawlSource(ctx, "c1", "")
 	c.Knowledge.Export(ctx, ExportOptions{})
 	c.Agent.Turn(ctx, AgentTurnRequest{Message: "hi"})
+	c.Agent.Settings(ctx, "")
+	c.Agent.UpdateSettings(ctx, AgentSettingsUpdate{Loop: &AgentLoopUpdate{Stream: Set(true)}})
+	c.Agent.ListMCPServers(ctx, "")
+	c.Agent.CreateMCPServer(ctx, MCPServerInput{Name: "a", EndpointURL: "https://a.test/mcp", AuthType: "none"})
+	c.Agent.GetMCPServer(ctx, "c1", "")
+	c.Agent.UpdateMCPServer(ctx, "c1", MCPServerUpdate{})
+	c.Agent.DeleteMCPServer(ctx, "c1", "")
 	c.Voice.Speak(ctx, "hi", "", "")
 	c.Voice.Transcribe(ctx, []byte{1, 2}, "", "")
 	c.Voice.PlaceCall(ctx, CallRequest{To: "+8801712345678", Purpose: "reminder", ConsentBasis: "customer"})
@@ -157,6 +164,7 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 	c.Channels.LinkedInPublish(ctx, "hi", "")
 	c.Sessions.BindCredential(ctx, "s1", "erp", CredentialBinding{Token: "t", ExpiresAt: "2027-01-01T00:00:00Z"})
 	c.Sessions.UnbindCredential(ctx, "s1", "erp")
+	c.Usage.Get(ctx, "", "")
 	c.MCP.ListTools(ctx)
 
 	used := map[string]bool{}
@@ -164,6 +172,9 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 		used[s.method+" "+strings.TrimPrefix(strings.SplitN(s.path, "?", 2)[0], "/core")] = true
 	}
 	for name, r := range routes {
+		if websocket[name] {
+			continue // opened on a real socket in stt_test.go
+		}
 		id := "c1"
 		if strings.HasPrefix(name, "voice.jobs") {
 			id = "j1"
@@ -297,6 +308,18 @@ func TestStreamErrors(t *testing.T) {
 	_, c = newFake(t, sse("event: delta\ndata: {\"text\":\"half\"}\n\n"))
 	if _, err = c.AI.Stream(ctx, CompleteRequest{Messages: hi}, nil); !errors.As(err, &e) || e.Code != "STREAM_ERROR" {
 		t.Errorf("a stream that stops before done: %+v", err)
+	}
+}
+
+func TestAgentTurnStreamsAndEndsWithTheWholeTurn(t *testing.T) {
+	f, c := newFake(t, sse("event: delta\ndata: {\"text\":\"Good \"}\n\nevent: delta\ndata: {\"text\":\"morning.\"}\n\nevent: done\ndata: {\"session_id\":\"s1\",\"text\":\"Good morning.\",\"sources\":0,\"usage\":{}}\n\n"))
+	var deltas []string
+	res, err := c.Agent.Stream(ctx, AgentTurnRequest{Message: "hello", Context: map[string]any{"interaction": "voice"}}, func(s string) { deltas = append(deltas, s) })
+	if err != nil || res.Text != "Good morning." || res.SessionID != "s1" || strings.Join(deltas, "|") != "Good |morning." {
+		t.Errorf("res=%+v deltas=%v err=%v", res, deltas, err)
+	}
+	if f.seen[0].path != "/core/agent/turn" || !strings.Contains(f.seen[0].body, `"stream":true`) || !strings.Contains(f.seen[0].body, `"context":{"interaction":"voice"}`) {
+		t.Errorf("sent %s %s", f.seen[0].path, f.seen[0].body)
 	}
 }
 
@@ -491,6 +514,7 @@ func TestAKeyIsOnlySentWhereTheRouteTakesOne(t *testing.T) {
 	_, _ = c.Knowledge.CreateSource(keyed, SourceInput{RootURL: "https://x.test"})
 	_ = c.Knowledge.CrawlSource(keyed, "c1", "")
 	_, _ = c.Agent.Turn(keyed, AgentTurnRequest{Message: "hi"})
+	_, _ = c.Agent.CreateMCPServer(keyed, MCPServerInput{Name: "a", EndpointURL: "https://a.test/mcp", AuthType: "none"})
 	_, _ = c.Voice.PlaceCall(keyed, aCall)
 	_, _ = c.Voice.CreateJob(keyed, VoiceJobRequest{Kind: "transcribe", SourceURL: "https://x.test/a.mp3"})
 	_, _ = c.Conversations.PostMessage(keyed, "s1", []Block{{"type": "text", "markdown": "hi"}})

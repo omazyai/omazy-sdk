@@ -2,6 +2,66 @@
 
 The TypeScript, Python and Go clients share one version number.
 
+## 0.4.0 (2026-11-23)
+
+The Enterprise API: one workspace per customer. Nothing in 0.3.0 changed its name or its shape.
+
+- A second client for a product that serves many customers, each in a workspace of their own: `OmazyEnterprise` in TypeScript and Python, `omazy.NewEnterprise` in Go. It takes an account key (`eak_...`), not an install token.
+- Create the workspace of a customer, with its agent, its plan and its install, and get that customer's Core API token once. Your own id for the customer (`external_id`) makes the call safe to repeat: a repeat returns the same workspace and no token, so the client retries it like a read.
+- List the account's workspaces page by page or all at once, find one by your own id, read one, rename and rebrand it, suspend and resume it, close it and reopen it.
+- Rotate a customer's install token, with the old one kept for an overlap. This is never sent twice by the client.
+- `core(token)` (`Core` in Go) gives the Core API client for one customer on the same deployment, so a product picks a customer's token and calls models, knowledge and the agent as that customer.
+- An account key never reaches the Core API, and an install token never reaches the Enterprise API.
+- The routes are listed in a contract of their own, `contracts/enterprise-api.routes.json`, and each client's tests are held to it.
+- An account key is issued by Omazy to a product. There is no self-serve way to get one yet.
+
+The agent's settings, under a new scope `agent:configure`:
+
+- Read how the agent runs and change it from your backend: the model it answers on, the cap on one reply, the temperature, and the loop switches (the shared agent loop, streaming, masking of personal data, `memory`, which gives the agent remember and forget tools, and `files`, which gives it a create_file tool). `agent.settings.get` and `agent.settings.update` in TypeScript and Python, `Agent.Settings` and `Agent.UpdateSettings` in Go.
+- A change names only what changes. Null puts a setting back to what the agent inherits: `null` in TypeScript, `None` in Python (an argument left out is `UNSET`), `omazy.Clear` in Go beside `omazy.Set`.
+- A new model is tested with one real call before it is saved. `403 MODEL_NOT_AVAILABLE` is a model the plan does not allow; `422 MODEL_NOT_SERVING` is one that did not answer. Nothing changes in either case.
+- The same change sent twice leaves the same settings, so the client sends it again after a 429, a gateway error or a dropped connection.
+- A token made before this release does not hold `agent:configure`. Scopes are fixed when a token is made, so make a new one.
+
+Live speech to text, on the existing scope `voice:speech`:
+
+- `voice.transcribeStream` in TypeScript, `voice.transcribe_stream` in Python, `Voice.TranscribeStream` in Go: a WebSocket session that hears audio while the person speaks, so the text is ready a few hundred milliseconds after they stop instead of after the whole recording is uploaded and heard.
+- Send audio as it is captured (`pcm_s16le`, `mulaw`, `alaw` with a sample rate, or `auto` for WebM/Opus, Ogg or WAV). `commit` after each utterance returns its final; `end` returns every final joined and the audio length it is billed by; `keepalive` holds a quiet session. Frames are `ready`, `partial`, `final` and `done`; an `error` frame arrives as the client's error with its code and request id.
+- Voice minutes are counted once per session with a one-minute floor. Hold one session for a conversation and commit per utterance.
+- The token goes on the upgrade: run it on your server, and relay from a browser. Zero dependencies: TypeScript uses the runtime's WebSocket (Cloudflare Workers, Node 22 and later, Bun, Deno; `webSocket` to bring another), Python and Go carry a small client of their own.
+- `terms` on `voice.transcribe` (trailing arguments in Go): names and words to expect, so "Rashed Karim" is not heard as "Rasht Kareem". At most 200; more is refused, never cut.
+- The contract marks a WebSocket route with `websocket`, and each client's tests hold its list to it.
+
+Control over the gateway's response cache on completions:
+
+- `cache_ttl` on `ai.complete` and `ai.stream` (`CacheTTL` in Go): leave it out for the gateway's own setting, `0` for a reply that never comes from the cache, or 60 to 2592000 seconds to bound how long a stored reply may be served again. Send `0` on any request that carries live data.
+- `cache_hit` on the result (`CacheHit` in Go) says the reply came from the cache. Such a reply cost nothing and used no AI turn.
+
+Agent turns that stream and take the person's context, on the existing scope `agent:run`:
+
+- `agent.stream` in TypeScript and Python, `Agent.Stream` in Go: the reply arrives in pieces as the agent writes it, then the whole turn. The frames are a streamed completion's. In TypeScript `StreamEvent` takes the result type, `StreamEvent<AgentTurnResult>`; `StreamEvent` alone is still a completion's.
+- The agent's markup for quick replies and images is held back from the pieces, so a piece is safe to read aloud. Keep the text of the whole turn.
+- When the agent's settings turn streaming off or masking of personal data on, only the whole turn arrives. An agent with connected tools sends its whole reply as one piece for now: its tool loop does not stream a turn made through the Core API yet.
+- `context` on a turn (`Context` in Go): one object of at most 2048 bytes about where the person is, read by the agent as a hint, as a widget page's context is. `{"interaction": "voice"}` makes it answer for the ear.
+- Nothing changed for `agent.turn`.
+
+The agent's MCP servers, under a new scope `agent:tools`:
+
+- Connect, list, read, change and remove the MCP tool servers the agent may call: `agent.mcpServers` in TypeScript, `agent.mcp_servers` in Python, `Agent.ListMCPServers` and its siblings in Go. For a product with a workspace per customer, this is how each customer's agent gets that customer's tools.
+- A server's name is unique within the app, ignoring case. A second one is `409 CONFLICT`.
+- The endpoint must be https on a public host, or the call is refused with `400`.
+- The credential is write-only. No call returns it.
+- Connecting a server takes an idempotency key and is sent again only with one. A change is sent again like a read. A removal is never sent twice.
+- `subject_check` on a `session_bearer` server: `whoami` (the default) asks the server whose token it is, `host` takes your backend's word for a server that has no `whoami`, such as Notion's, Slack's or Microsoft 365's. Each conversation stays locked to one person either way. Binding a token now answers `verified` with the one that was used.
+
+Usage and cost, under a new scope `usage:read`:
+
+- `usage.get` in TypeScript and Python, `Usage.Get` in Go: what the workspace used and what it cost, per UTC day, with totals. Model calls, replies from the gateway's response cache (free), tokens, speech sessions and seconds, cost in millionths of a US dollar, and the plan's counters (conversations, AI turns, API calls, voice minutes).
+- A range is two days as `YYYY-MM-DD`, both included, at most 90 days; the last 30 days when you name none. It is a read, so the client sends it again after a 429 or a gateway error.
+- Text to speech is priced from a list price per character until it is checked against an invoice; that part of the cost is in `estimated_cost_micros`.
+- A token made before this release does not hold `usage:read`. A managed workspace's install gets it by default.
+- Across an enterprise account: `usage()` on `OmazyEnterprise` (`Usage` in Go) gives a page of the account's workspaces, each with its totals and days, and the account's totals over every workspace. Needs the account scope `usage:read`, which has the same name.
+
 ## 0.3.0 (2026-11-20)
 
 Idempotency keys. Nothing in 0.2.0 changed its name or its shape.

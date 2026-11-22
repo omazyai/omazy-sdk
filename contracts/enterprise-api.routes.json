@@ -1,0 +1,15 @@
+{
+  "$comment": "The Enterprise API route list, for a product that runs one workspace per customer on Omazy. The API fails its tests when a route under /api/v1/enterprise is missing here or differs, and each SDK fails its tests when it does not cover a route. A route is added here in the same commit that adds it to the API. sdk names the client method. repeatable marks a route a client may send again after a failure: it reads, or sending it twice leaves the same state as sending it once. An account key never reaches the Core API; each workspace has its own install token for that.",
+  "base": "/api/v1/enterprise",
+  "auth": "Authorization: Bearer eak_<prefix>.<secret>",
+  "routes": [
+    { "method": "GET",    "path": "/account",                          "scope": "",                  "sdk": "account",                   "repeatable": true },
+    { "method": "GET",    "path": "/workspaces",                       "scope": "workspaces:manage", "sdk": "workspaces.list",           "repeatable": true },
+    { "method": "POST",   "path": "/workspaces",                       "scope": "workspaces:manage", "sdk": "workspaces.create",         "repeatable": true },
+    { "method": "GET",    "path": "/workspaces/{id}",                  "scope": "workspaces:manage", "sdk": "workspaces.get",            "repeatable": true },
+    { "method": "PATCH",  "path": "/workspaces/{id}",                  "scope": "workspaces:manage", "sdk": "workspaces.update",         "repeatable": true },
+    { "method": "DELETE", "path": "/workspaces/{id}",                  "scope": "workspaces:manage", "sdk": "workspaces.close",          "repeatable": true },
+    { "method": "POST",   "path": "/workspaces/{id}/install/rotate",   "scope": "installs:manage",   "sdk": "workspaces.rotate_install", "repeatable": false },
+    { "method": "GET",    "path": "/usage",                            "scope": "usage:read",        "sdk": "usage",                     "repeatable": true }
+  ]
+}

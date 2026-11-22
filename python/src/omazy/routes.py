@@ -18,8 +18,16 @@ ROUTES = {
     "knowledge.sources.crawl": ("POST", "/knowledge/sources/{id}/crawl"),
     "knowledge.export": ("GET", "/knowledge/export"),
     "agent.turn": ("POST", "/agent/turn"),
+    "agent.settings.get": ("GET", "/agent/settings"),
+    "agent.settings.update": ("PATCH", "/agent/settings"),
+    "agent.mcp_servers.list": ("GET", "/agent/mcp-servers"),
+    "agent.mcp_servers.create": ("POST", "/agent/mcp-servers"),
+    "agent.mcp_servers.get": ("GET", "/agent/mcp-servers/{id}"),
+    "agent.mcp_servers.update": ("PATCH", "/agent/mcp-servers/{id}"),
+    "agent.mcp_servers.delete": ("DELETE", "/agent/mcp-servers/{id}"),
     "voice.speak": ("POST", "/voice/speak"),
     "voice.transcribe": ("POST", "/voice/transcribe"),
+    "voice.transcribe_stream": ("GET", "/voice/transcribe/stream"),
     "voice.calls.place": ("POST", "/voice/calls"),
     "voice.calls.get": ("GET", "/voice/calls/{ref}"),
     "voice.jobs.create": ("POST", "/voice/jobs"),
@@ -30,6 +38,7 @@ ROUTES = {
     "channels.linkedin_publish": ("POST", "/channels/linkedin/publish"),
     "sessions.bind_credential": ("PUT", "/sessions/{sid}/mcp-credentials/{server}"),
     "sessions.unbind_credential": ("DELETE", "/sessions/{sid}/mcp-credentials/{server}"),
+    "usage.get": ("GET", "/usage"),
     "mcp": ("POST", "/mcp"),
 }
 
@@ -47,11 +56,22 @@ RETRYABLE = frozenset(
         "knowledge.documents.get",
         "knowledge.sources.list",
         "knowledge.export",
+        # Reading the agent's settings, and changing them: the same change
+        # sent twice leaves the same settings.
+        "agent.settings.get",
+        "agent.settings.update",
+        # The agent's MCP servers: reads, and a change, which leaves the same
+        # server when it is sent twice. Removing one is not here: a second
+        # delete answers 404 for a server the first one removed.
+        "agent.mcp_servers.list",
+        "agent.mcp_servers.get",
+        "agent.mcp_servers.update",
         "voice.speak",
         "voice.transcribe",
         "voice.calls.get",
         "voice.jobs.get",
         "customers.get",
+        "usage.get",
     }
 )
 
@@ -65,9 +85,14 @@ IDEMPOTENT = frozenset(
         "knowledge.sources.create",
         "knowledge.sources.crawl",
         "agent.turn",
+        "agent.mcp_servers.create",
         "voice.calls.place",
         "voice.jobs.create",
         "conversations.post_message",
         "channels.linkedin_publish",
     }
 )
+
+# Routes that are a WebSocket: the client opens them with an Upgrade request
+# carrying the same token, and never retries one.
+WEBSOCKET = frozenset({"voice.transcribe_stream"})

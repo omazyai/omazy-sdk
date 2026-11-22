@@ -1,8 +1,12 @@
 import { OmazyError } from './errors.js'
 import { McpClient } from './mcp.js'
 import { IDEMPOTENT, RETRYABLE, ROUTES, type RouteName } from './routes.js'
+import { defaultWebSocket, openTranscription, type TranscriptionSession, type WebSocketFactory } from './stt.js'
 import { readSse } from './sse.js'
+import { buildUrl, request, type ResponseInfo, type Transport } from './transport.js'
 import type {
+  AgentSettings,
+  AgentSettingsUpdate,
   AgentTurnRequest,
   AgentTurnResult,
   Block,
@@ -18,19 +22,35 @@ import type {
   KnowledgeDocument,
   KnowledgeExport,
   KnowledgePassage,
+  McpServer,
+  McpServerInput,
+  McpServerUpdate,
   StreamEvent,
+  UsageRange,
+  UsageReport,
+  TranscriptionStreamOptions,
   VoiceJobRequest,
   Whoami,
 } from './types.js'
 
 export { OmazyError } from './errors.js'
 export { McpClient, type McpTool, type McpToolResult } from './mcp.js'
-export { ROUTES, RETRYABLE, IDEMPOTENT, type RouteName } from './routes.js'
+export { ROUTES, RETRYABLE, IDEMPOTENT, WEBSOCKET, type RouteName } from './routes.js'
+export { TranscriptionSession, type SocketLike, type WebSocketFactory } from './stt.js'
 export { readSse, type SseFrame } from './sse.js'
+export type { ResponseInfo } from './transport.js'
+export {
+  OmazyEnterprise,
+  DEFAULT_ENTERPRISE_BASE_URL,
+  ENTERPRISE_ROUTES,
+  ENTERPRISE_REPEATABLE,
+  type EnterpriseRouteName,
+  type OmazyEnterpriseOptions,
+} from './enterprise.js'
 export type * from './types.js'
 
 export const DEFAULT_BASE_URL = 'https://mw.omazy.ai/api/v1/core'
-export const VERSION = '0.3.0'
+export const VERSION = '0.4.0'
 
 export interface OmazyOptions {
   /** An install token, `cai_<prefix>.<secret>`. Server side only. */
@@ -46,6 +66,12 @@ export interface OmazyOptions {
   /** Give up on a request after this long. Default 130 s, just above the API's own limit. */
   timeoutMs?: number
   fetch?: typeof fetch
+  /**
+   * Opens the socket of a live transcription. The default works in a
+   * Cloudflare Worker, Node 22 and later, Bun and Deno: each can send the
+   * token on the upgrade. Pass one for another runtime or a WebSocket library.
+   */
+  webSocket?: WebSocketFactory
 }
 
 /**
@@ -58,18 +84,6 @@ export interface WriteOptions {
   idempotencyKey?: string
 }
 
-/** What the API said about limits and the token on the last response. */
-export interface ResponseInfo {
-  requestId?: string
-  rateLimit?: { limit: number; remaining: number; resetSeconds: number }
-  /** Set when the token has a deadline. */
-  tokenExpiresAt?: string
-  /** True while the caller is still on a token a rotation replaced. */
-  tokenIsPrevious: boolean
-  /** True when the answer is the remembered answer of an earlier request with the same idempotency key. */
-  replayed: boolean
-}
-
 interface CallInit {
   path?: Record<string, string>
   query?: Record<string, string | undefined>
@@ -79,8 +93,6 @@ interface CallInit {
   signal?: AbortSignal
   idempotencyKey?: string
 }
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /**
  * Client for the Omazy Core API: models, knowledge, your agent, speech and
@@ -96,8 +108,8 @@ export class Omazy {
   private readonly base: string
   private readonly app?: string
   private readonly maxRetries: number
-  private readonly timeoutMs: number
-  private readonly fetcher: typeof fetch
+  private readonly transport: Transport
+  private readonly webSocket: WebSocketFactory
   /** Headers of the most recent response: request id, rate limit, token deadline. */
   last: ResponseInfo = { tokenIsPrevious: false, replayed: false }
 
@@ -109,8 +121,17 @@ export class Omazy {
     this.base = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '')
     this.app = opts.app
     this.maxRetries = opts.maxRetries ?? 2
-    this.timeoutMs = opts.timeoutMs ?? 130_000
-    this.fetcher = opts.fetch ?? globalThis.fetch.bind(globalThis)
+    this.transport = {
+      token: this.token,
+      timeoutMs: opts.timeoutMs ?? 130_000,
+      fetcher: opts.fetch ?? globalThis.fetch.bind(globalThis),
+      userAgent: `omazy-sdk-typescript/${VERSION}`,
+      api: 'the Core API',
+      onResponse: (info) => {
+        this.last = info
+      },
+    }
+    this.webSocket = opts.webSocket ?? defaultWebSocket(this.transport.fetcher)
     this.mcp = new McpClient(
       async (body) => (await this.send('mcp', { json: body })).json(),
       this.base + ROUTES.mcp[1],
@@ -131,7 +152,8 @@ export class Omazy {
      * `done` with the full result. Throws OmazyError if the stream reports an
      * error or ends before `done`. A stream is not retried.
      */
-    stream: (req: CompleteRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent> => this.stream(req, signal),
+    stream: (req: CompleteRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent> =>
+      this.stream<CompleteResult>('ai.complete', req, signal),
   }
 
   readonly knowledge = {
@@ -230,6 +252,69 @@ export class Omazy {
         idempotencyKey: (o as WriteOptions).idempotencyKey,
       })
     },
+
+    /**
+     * The same turn as a stream: `delta` events as the reply is written, with
+     * the agent's reply markup held back, then one `done` with the whole turn.
+     * Keep the text from `done`. When the agent's settings turn streaming off
+     * or redaction on, only `done` arrives. Throws OmazyError if the stream
+     * reports an error or ends before `done`. A stream is not retried, and
+     * an idempotency key does not replay it. Needs `agent:run`.
+     */
+    stream: (req: AgentTurnRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent<AgentTurnResult>> =>
+      this.stream<AgentTurnResult>('agent.turn', req, signal),
+
+    settings: {
+      /**
+       * How the agent runs: its model with the reply cap and temperature, the
+       * models the plan allows, and the loop switches. Needs `agent:configure`.
+       */
+      get: (opts: { app?: string } = {}) =>
+        this.json<AgentSettings>('agent.settings.get', { query: { app: opts.app ?? this.app } }),
+
+      /**
+       * Changes the model, the reply cap, the temperature or the loop
+       * switches, and returns the settings after the change. A new model is
+       * tested with one real call before it is saved, so allow up to 90
+       * seconds. A model off the plan is `MODEL_NOT_AVAILABLE`; one that did
+       * not answer is `MODEL_NOT_SERVING`, and nothing changes. The same
+       * change sent twice leaves the same settings. Needs `agent:configure`.
+       */
+      update: (req: AgentSettingsUpdate) =>
+        this.json<AgentSettings>('agent.settings.update', { json: this.withApp(req) }),
+    },
+
+    /**
+     * The MCP tool servers the agent may call. Needs `agent:tools`.
+     *
+     * This is not `omazy.mcp`, which is Omazy as an MCP server for your own
+     * agent. These are the servers Omazy's agent calls.
+     */
+    mcpServers: {
+      /** The agent's servers, newest first. A credential is never returned. */
+      list: (opts: { app?: string } = {}) =>
+        this.json<McpServer[]>('agent.mcp_servers.list', { query: { app: opts.app ?? this.app } }),
+
+      get: (id: string, opts: { app?: string } = {}) =>
+        this.json<McpServer>('agent.mcp_servers.get', { path: { id }, query: { app: opts.app ?? this.app } }),
+
+      /**
+       * Connects a server. Its tools reach the model from the agent's next
+       * turn as `mcp_<name>__<tool>`. The name is unique within the app: a
+       * second server with it is `409 CONFLICT`. The endpoint must be https on
+       * a public host. Retried only with an idempotency key.
+       */
+      create: (req: McpServerInput, opts: WriteOptions = {}) =>
+        this.json<McpServer>('agent.mcp_servers.create', { json: this.withApp(req), idempotencyKey: opts.idempotencyKey }),
+
+      /** Changes a server. Send only what changes. `credentials: ''` removes the stored credential. */
+      update: (id: string, req: McpServerUpdate) =>
+        this.json<McpServer>('agent.mcp_servers.update', { path: { id }, json: this.withApp(req) }),
+
+      /** Removes a server and its stored credential. Never sent twice by the client. */
+      delete: (id: string, opts: { app?: string } = {}) =>
+        this.json<{ id: string; deleted: true }>('agent.mcp_servers.delete', { path: { id }, query: { app: opts.app ?? this.app } }),
+    },
   }
 
   readonly voice = {
@@ -238,13 +323,32 @@ export class Omazy {
       const res = await this.send('voice.speak', { json: this.withApp({ text, ...opts }) })
       return { audio: await res.arrayBuffer(), language: res.headers.get('x-omazy-speech-lang') ?? '' }
     },
-    /** Speech to text. `audio` is the raw recording, at most 8 MB. Needs `voice:speech`. */
-    transcribe: (audio: BodyInit, opts: { lang?: string; app?: string; contentType?: string } = {}) =>
+    /**
+     * Speech to text. `audio` is the raw recording, at most 8 MB. `terms` are
+     * names and words to expect, so they come back spelled right. Needs `voice:speech`.
+     */
+    transcribe: (audio: BodyInit, opts: { lang?: string; app?: string; contentType?: string; terms?: string[] } = {}) =>
       this.json<{ text: string; language: string }>('voice.transcribe', {
         body: audio,
-        query: { lang: opts.lang, app: opts.app ?? this.app },
+        query: { lang: opts.lang, app: opts.app ?? this.app, terms: opts.terms?.length ? opts.terms.join(',') : undefined },
         headers: { 'content-type': opts.contentType ?? 'application/octet-stream' },
       }),
+    /**
+     * Live speech to text over a WebSocket. Open it when the person starts
+     * speaking (or once for a whole conversation), send audio as it is
+     * captured, `commit()` after each utterance and `end()` to finish. The
+     * text is ready a few hundred milliseconds after they stop. Server side
+     * only: the token goes on the upgrade. Never retried. Needs `voice:speech`.
+     */
+    transcribeStream: (opts: TranscriptionStreamOptions = {}): Promise<TranscriptionSession> => {
+      const url = buildUrl(this.base.replace(/^http/, 'ws'), ROUTES['voice.transcribe_stream'][1], {}, { app: opts.app ?? this.app })
+      return openTranscription(
+        this.webSocket,
+        url,
+        { authorization: `Bearer ${this.token}`, 'user-agent': this.transport.userAgent },
+        opts,
+      )
+    },
     calls: {
       /**
        * Queue an outbound call answered by the agent. Retried only with an
@@ -299,13 +403,23 @@ export class Omazy {
       this.json<Json>('sessions.unbind_credential', { path: { sid: sessionId, server } }),
   }
 
+  readonly usage = {
+    /**
+     * What the workspace used and what it cost, per UTC day: model calls,
+     * cache hits, tokens, speech, cost, and the plan's counters. The last 30
+     * days by default, at most 90. Needs `usage:read`.
+     */
+    get: (range: UsageRange = {}) => this.json<UsageReport>('usage.get', { query: { from: range.from, to: range.to } }),
+  }
+
   private withApp<T extends object>(req: T): T {
     return this.app && (req as { app?: string }).app === undefined ? { ...req, app: this.app } : req
   }
 
-  private async *stream(req: CompleteRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent> {
+  /** Reads a streamed route's server-sent events: `delta`, then `done` or `error`. */
+  private async *stream<R>(route: RouteName, req: object, signal?: AbortSignal): AsyncGenerator<StreamEvent<R>> {
     const res = await this.send(
-      'ai.complete',
+      route,
       { json: this.withApp({ ...req, stream: true }), signal, headers: { accept: 'text/event-stream' } },
       0,
     )
@@ -314,7 +428,7 @@ export class Omazy {
       if (frame.event === 'delta') {
         yield { type: 'delta', text: (JSON.parse(frame.data) as { text: string }).text }
       } else if (frame.event === 'done') {
-        yield { type: 'done', result: JSON.parse(frame.data) as CompleteResult }
+        yield { type: 'done', result: JSON.parse(frame.data) as R }
         return
       } else if (frame.event === 'error') {
         const e = JSON.parse(frame.data) as { message?: string; code?: string }
@@ -332,93 +446,19 @@ export class Omazy {
   }
 
   /** Sends a request with retries. Resolves with a 2xx response; throws OmazyError otherwise. */
-  private async send(route: RouteName, init: CallInit = {}, retries = this.maxRetries): Promise<Response> {
+  private send(route: RouteName, init: CallInit = {}, retries = this.maxRetries): Promise<Response> {
     const [method, template] = ROUTES[route]
-    let path = template as string
-    for (const [k, v] of Object.entries(init.path ?? {})) path = path.replace(`{${k}}`, encodeURIComponent(v))
-    const q = new URLSearchParams()
-    for (const [k, v] of Object.entries(init.query ?? {})) if (v) q.set(k, v)
-    const url = this.base + path + (q.size ? `?${q}` : '')
-    const headers: Record<string, string> = {
-      authorization: `Bearer ${this.token}`,
-      'user-agent': `omazy-sdk-typescript/${VERSION}`,
-      ...(init.json !== undefined ? { 'content-type': 'application/json' } : {}),
-      ...init.headers,
-    }
     // A key makes a request that changes something safe to send again.
     const keyed = Boolean(init.idempotencyKey) && IDEMPOTENT.has(route)
-    if (keyed) headers['idempotency-key'] = init.idempotencyKey!
-    const body = init.json !== undefined ? JSON.stringify(init.json) : init.body
-    // A stream can be read once, so a request whose body is one is sent once.
-    const once = typeof ReadableStream !== 'undefined' && body instanceof ReadableStream
-    const attempts = (RETRYABLE.has(route) || keyed) && !once ? retries : 0
-
-    for (let attempt = 0; ; attempt++) {
-      const timeout = AbortSignal.timeout(this.timeoutMs)
-      const signal = init.signal ? AbortSignal.any([init.signal, timeout]) : timeout
-      let res: Response
-      try {
-        res = await this.fetcher(url, { method, headers, body, signal })
-      } catch (err) {
-        if (init.signal?.aborted) throw err
-        if (attempt < attempts) {
-          await sleep(backoff(attempt))
-          continue
-        }
-        throw new OmazyError(`no response from the Core API: ${(err as Error).message}`, 0, 'NETWORK_ERROR')
-      }
-      this.last = readInfo(res.headers)
-      if (res.ok) return res
-
-      const retryAfter = Number(res.headers.get('retry-after')) || undefined
-      const failed = await readError(res)
-      const transient =
-        res.status === 429 ||
-        res.status === 502 ||
-        res.status === 503 ||
-        res.status === 504 ||
-        // The first request with this key is still running: wait and ask again.
-        (keyed && res.status === 409 && failed.code === 'IDEMPOTENCY_IN_PROGRESS')
-      // A long Retry-After means the window is full; waiting it out here would
-      // hide a stalled caller. Hand that decision back.
-      if (transient && attempt < attempts && (retryAfter ?? 0) <= 30) {
-        await sleep(retryAfter ? retryAfter * 1000 : backoff(attempt))
-        continue
-      }
-      throw new OmazyError(failed.message, res.status, failed.code, this.last.requestId, retryAfter)
-    }
+    return request(this.transport, {
+      method,
+      url: buildUrl(this.base, template, init.path, init.query),
+      json: init.json,
+      body: init.body,
+      headers: init.headers,
+      signal: init.signal,
+      retries: RETRYABLE.has(route) || keyed ? retries : 0,
+      idempotencyKey: keyed ? init.idempotencyKey : undefined,
+    })
   }
-}
-
-const backoff = (attempt: number) => Math.min(8000, 500 * 2 ** attempt) * (0.5 + Math.random() / 2)
-
-function readInfo(h: Headers): ResponseInfo {
-  const limit = h.get('x-ratelimit-limit')
-  return {
-    requestId: h.get('x-request-id') ?? undefined,
-    rateLimit: limit
-      ? {
-          limit: Number(limit),
-          remaining: Number(h.get('x-ratelimit-remaining')),
-          resetSeconds: Number(h.get('x-ratelimit-reset')),
-        }
-      : undefined,
-    tokenExpiresAt: h.get('x-omazy-token-expires-at') ?? undefined,
-    tokenIsPrevious: h.get('x-omazy-token-use') === 'previous',
-    replayed: h.get('idempotent-replayed') === 'true',
-  }
-}
-
-async function readError(res: Response): Promise<{ code: string; message: string }> {
-  const text = await res.text().catch(() => '')
-  try {
-    const body = JSON.parse(text) as { error?: { code?: string; message?: string } | string }
-    if (body.error && typeof body.error === 'object') {
-      return { code: body.error.code ?? `HTTP_${res.status}`, message: body.error.message ?? res.statusText }
-    }
-    if (typeof body.error === 'string') return { code: `HTTP_${res.status}`, message: body.error }
-  } catch {
-    // not JSON
-  }
-  return { code: `HTTP_${res.status}`, message: text.slice(0, 300) || res.statusText || `HTTP ${res.status}` }
 }
