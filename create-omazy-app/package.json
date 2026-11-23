@@ -1,0 +1,44 @@
+{
+  "name": "create-omazy-app",
+  "version": "0.5.0",
+  "description": "Creates an AI product on the Omazy SDK kits: a Cloudflare Worker with capabilities, the guard and an MCP door, ready to deploy.",
+  "keywords": [
+    "omazy",
+    "ai",
+    "mcp",
+    "cloudflare-workers",
+    "create"
+  ],
+  "author": "Mosthofa Imran (https://github.com/johnefemer)",
+  "license": "MIT",
+  "homepage": "https://docs.omazy.ai/build-on-omazy/create-omazy-app/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/omazyai/omazy-sdk.git",
+    "directory": "create-omazy-app"
+  },
+  "bugs": {
+    "url": "https://github.com/omazyai/omazy-sdk/issues"
+  },
+  "type": "module",
+  "bin": {
+    "create-omazy-app": "bin/create-omazy-app.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "bun test",
+    "sync": "bun scripts/sync-migrations.ts"
+  }
+}

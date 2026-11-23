@@ -1,5 +1,8 @@
 """Client for the Omazy Core API. Standard library only."""
 
+import contextlib
+import contextvars
+import dataclasses
 import json
 import random
 import time
@@ -14,7 +17,7 @@ from .routes import IDEMPOTENT, RETRYABLE, ROUTES
 from .stt import TranscriptionSession, open_transcription
 
 DEFAULT_BASE_URL = "https://mw.omazy.ai/api/v1/core"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 Json = Dict[str, Any]
 
@@ -47,6 +50,34 @@ class ResponseInfo:
     #: True when the answer is the remembered answer of an earlier request
     #: with the same idempotency key.
     replayed: bool = False
+
+
+# The with_response blocks open in this thread or task, innermost last, each a
+# (client, info) pair. A thread starts with none, so one thread's block never
+# sees another thread's responses.
+_capturing: "contextvars.ContextVar[Tuple[Tuple[Any, ResponseInfo], ...]]" = contextvars.ContextVar(
+    "omazy_capturing", default=()
+)
+
+
+@contextlib.contextmanager
+def _with_response(client: Any) -> Iterator[ResponseInfo]:
+    info = ResponseInfo()
+    token = _capturing.set(_capturing.get() + ((client, info),))
+    try:
+        yield info
+    finally:
+        _capturing.reset(token)
+
+
+def _record(client: Any, info: ResponseInfo) -> None:
+    """Keeps a response's headers as the client's ``last`` and in every
+    ``with_response`` block of this client open in this thread."""
+    client.last = info
+    for owner, into in _capturing.get():
+        if owner is client:
+            for f in dataclasses.fields(ResponseInfo):
+                setattr(into, f.name, getattr(info, f.name))
 
 
 @dataclass
@@ -111,7 +142,10 @@ class Omazy:
         self._timeout = timeout
         self._open = opener or urllib.request.urlopen
         self._sleep = sleep
-        #: Headers of the most recent response.
+        #: Headers of the most recent response of this client, whichever call
+        #: it answered. When threads share the client, another call's response
+        #: can replace it between your call and your read: use
+        #: ``with_response`` for the headers of your own calls.
         self.last = ResponseInfo()
 
         self.ai = _AI(self)
@@ -123,11 +157,32 @@ class Omazy:
         self.channels = _Channels(self)
         self.sessions = _Sessions(self)
         self.usage = _Usage(self)
+        self.budgets = _Budgets(self)
         self.mcp = McpClient(self)
+
+    def with_response(self) -> "contextlib.AbstractContextManager[ResponseInfo]":
+        """The headers of the calls made inside the block, by this thread.
+
+        >>> with omazy.with_response() as response:
+        ...     answer = omazy.ai.complete(messages)
+        >>> log(response.request_id, response.rate_remaining)
+
+        ``response`` holds the last response this client received inside the
+        block in this thread (or asyncio task), so calls made at the same time
+        by other threads never change it. ``last`` still follows every
+        response.
+        """
+        return _with_response(self)
 
     def whoami(self) -> Json:
         """The workspace this token belongs to, its scopes and its deadline. Needs no scope."""
         return self._json("whoami")
+
+    def contract(self, format: Optional[str] = None) -> Json:
+        """The route contract the live platform was built with, or with
+        ``format="openapi"`` its OpenAPI document. The platform answers it
+        without a token."""
+        return self._json("contract", query={"format": format})
 
     # -- plumbing -----------------------------------------------------------
 
@@ -190,10 +245,11 @@ def _request(
         req = urllib.request.Request(url, data=data, headers=dict(headers), method=method)
         try:
             resp = client._open(req, timeout=client._timeout)
-            client.last = _info(resp.headers)
+            _record(client, _info(resp.headers))
             return _Response(resp.status, resp.headers, resp)
         except urllib.error.HTTPError as e:
-            client.last = _info(e.headers)
+            info = _info(e.headers)
+            _record(client, info)
             retry_after = _int(e.headers.get("Retry-After"))
             code, message = _read_error(e)
             e.close()
@@ -207,7 +263,7 @@ def _request(
                 client._sleep(retry_after if retry_after else _backoff(attempt))
                 attempt += 1
                 continue
-            raise OmazyError(message, e.code, code, client.last.request_id, retry_after) from None
+            raise OmazyError(message, e.code, code, info.request_id, retry_after) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             if attempt < attempts:
                 client._sleep(_backoff(attempt))
@@ -274,20 +330,51 @@ def read_sse(lines: Iterator[bytes]) -> Iterator[Tuple[str, str]]:
         yield event, "\n".join(data)
 
 
+class _AIRoles:
+    """Model roles. A call names one with ``model="role:extract.fast"``."""
+
+    def __init__(self, c: "Omazy") -> None:
+        self._c = c
+
+    def list(self, app: Optional[str] = None) -> Json:
+        """Every role this install can name and what it runs on. Needs ``ai:complete``."""
+        return self._c._json("ai.roles.list", query={"app": app if app is not None else self._c._app})
+
+    def set(self, name: str, model: str, fallbacks: Optional[List[str]] = None, level: Optional[str] = None) -> Json:
+        """Map a role to a model and up to three fallbacks, all on the plan. Needs ``ai:configure``.
+
+        ``level`` is ``"install"`` (the default) or ``"workspace"``.
+        """
+        return self._c._json("ai.roles.set", path={"name": name}, body=_drop_none({"model": model, "fallbacks": fallbacks, "level": level}))
+
+    def delete(self, name: str, level: Optional[str] = None) -> Json:
+        """Remove the install's (or the workspace's) mapping of a role. Needs ``ai:configure``."""
+        return self._c._json("ai.roles.delete", path={"name": name}, query={"level": level})
+
+
 class _AI:
     def __init__(self, c: Omazy) -> None:
         self._c = c
+        self.roles = _AIRoles(c)
 
     def complete(self, messages: List[Json], app: Optional[str] = None, **options: Any) -> Json:
         """One model call through the gateway. Needs ``ai:complete``.
 
-        Options: ``system``, ``tools``, ``tool_choice``, ``model`` (with its
-        provider, such as ``openai/gpt-4o-mini``), ``profile``, ``max_tokens``,
+        Options: ``system``, ``tools``, ``tool_choice`` (``"auto"``,
+        ``"any"``, ``"none"`` or ``{"type": "tool", "name": ...}``),
+        ``response_format`` (``{"type": "json_schema", "json_schema":
+        {"name": ..., "schema": {...}, "strict": True}}`` or ``{"type":
+        "json_object"}``), ``model`` (with its provider, such as
+        ``openai/gpt-4o-mini``), ``profile``, ``max_tokens``,
         ``temperature``, ``cache_ttl`` (the gateway's response cache: 0 never
         answers from it, 60 to 2592000 bounds in seconds how long a stored reply
-        may be served again). Returns ``text``, ``tool_calls``, ``stop_reason``,
-        ``model``, ``usage``, and ``cache_hit`` when the reply came from the
-        cache.
+        may be served again). A user message may carry ``images``: each
+        ``{"url": "https://..."}`` or ``{"data": <base64>, "media_type":
+        "image/png"}``. Returns ``text``, ``tool_calls``, ``stop_reason``,
+        ``model``, ``usage``, ``output`` (the reply as JSON when
+        ``response_format`` asked for it), and ``cache_hit`` when the reply
+        came from the cache. A model that cannot do what the call asks is a
+        422 ``MODEL_UNSUPPORTED``; ``ai.models()`` says what each can do.
         """
         body = self._c._with_app({"messages": messages, **options, "stream": False}, app)
         return self._c._json("ai.complete", body=body)
@@ -302,11 +389,33 @@ class _AI:
         body = self._c._with_app({"messages": messages, **options, "stream": True}, app)
         return _stream_events(self._c, "ai.complete", body)
 
+    def embed(self, input: Union[str, List[str]], model: Optional[str] = None, app: Optional[str] = None) -> Json:
+        """Vectors for one text or up to 128, in the order given. Needs ``ai:complete``.
+
+        Returns ``model``, ``dimensions``, ``embeddings`` (each ``index`` and
+        ``embedding``) and ``usage``. ``model`` left out is the deployment's
+        embedding model, the one ``models()`` lists with ``kind: embedding``.
+        """
+        body: Json = {"input": input}
+        if model is not None:
+            body["model"] = model
+        return self._c._json("ai.embed", body=self._c._with_app(body, app))
+
+    def models(self, app: Optional[str] = None) -> Json:
+        """The models this install may name, and what each can do. Needs ``ai:complete``.
+
+        Returns ``default`` and ``models``, each with ``id``, ``kind`` (chat or
+        embedding) and ``capabilities``: ``vision``, ``json_schema``,
+        ``json_schema_native``, ``tools``, ``context_tokens``.
+        """
+        return self._c._json("ai.models", query={"app": app if app is not None else self._c._app})
+
 
 def _stream_events(c: "Omazy", route: str, body: Json) -> Iterator[Json]:
     """Reads a streamed route's server-sent events: ``delta``, then ``done`` or ``error``."""
     res = c._send(route, body=body, headers={"Accept": "text/event-stream"}, retries=0)
-    request_id = c.last.request_id
+    # This response's own id: ``last`` may already belong to another call.
+    request_id = _info(res.headers).request_id
     try:
         for event, data in read_sse(iter(res.raw.readline, b"")):
             if event == "delta":
@@ -403,11 +512,15 @@ class _Documents:
         return self._c._json("knowledge.documents.create", body=body, idempotency_key=idempotency_key)
 
     def update(self, document_id: str, app: Optional[str] = None, **fields: Any) -> Json:
-        """Change the fields given and index the document again. Needs ``kb:write``."""
+        """Change the fields given and index the document again. The same
+        change sent twice leaves the same document, so the client retries it
+        like a read. Needs ``kb:write``."""
         return self._c._json("knowledge.documents.update", path={"id": document_id}, body=self._c._with_app(fields, app))
 
     def delete(self, document_id: str, app: Optional[str] = None) -> Json:
-        """Delete a document. The agent stops using it. Needs ``kb:write``."""
+        """Delete a document. The agent stops using it. Retried like a read:
+        when a retry answers ``NOT_FOUND``, an earlier attempt deleted it.
+        Needs ``kb:write``."""
         return self._c._json("knowledge.documents.delete", path={"id": document_id}, query={"app": app or self._c._app})
 
 
@@ -521,7 +634,8 @@ class _AgentMcpServers:
         return self._c._json("agent.mcp_servers.update", path={"id": server_id}, body=body)
 
     def delete(self, server_id: str, app: Optional[str] = None) -> Json:
-        """Removes a server and its stored credential. Never sent twice by the client."""
+        """Removes a server and its stored credential. Retried like a read:
+        when a retry answers ``NOT_FOUND``, an earlier attempt removed it."""
         return self._c._json("agent.mcp_servers.delete", path={"id": server_id}, query={"app": self._app(app)})
 
 
@@ -759,12 +873,50 @@ class _Customers:
         return self._c._json("customers.update", path={"id": customer_id}, body={"custom_fields": custom_fields})
 
 
+class _Budgets:
+    """Spend caps on this install, held before the call: a completion, an
+    embedding or an agent turn past a cap that covers it is refused with 402
+    ``BUDGET_EXCEEDED`` before any model runs."""
+
+    def __init__(self, c: "Omazy") -> None:
+        self._c = c
+
+    def list(self) -> Json:
+        """The caps with this period's spend. Needs ``usage:read``."""
+        return self._c._json("budgets.list")
+
+    def set(self, period: str, limit_usd: float, label: Optional[str] = None, value: Optional[str] = None) -> Json:
+        """Add a cap, or change the limit of the one with the same label, value
+        and period. ``period`` is ``"day"`` or ``"month"`` (UTC); ``label`` is
+        ``unit``, ``unit_version``, ``prompt_version`` or ``run_id`` (left out:
+        every call); ``value`` is its value or ``"*"`` for each value on its
+        own. Needs ``ai:configure``."""
+        return self._c._json("budgets.set", body=_drop_none({"label": label, "value": value, "period": period, "limit_usd": limit_usd}))
+
+    def delete(self, budget_id: str) -> Json:
+        """Remove a cap. Needs ``ai:configure``."""
+        return self._c._json("budgets.delete", path={"id": budget_id})
+
+
 class _Usage:
     def __init__(self, c: Omazy) -> None:
         self._c = c
 
-    def get(self, from_: Optional[str] = None, to: Optional[str] = None) -> Json:
+    def get(
+        self,
+        from_: Optional[str] = None,
+        to: Optional[str] = None,
+        group_by: Optional[str] = None,
+        unit: Optional[str] = None,
+        run_id: Optional[str] = None,
+    ) -> Json:
         """What the workspace used and what it cost, per UTC day. Needs ``usage:read``.
+
+        ``group_by`` (``unit``, ``unit_version``, ``prompt_version``,
+        ``run_id``, ``model``, ``model_role`` or ``tag.<key>``) adds
+        ``groups``: the costliest 100 values of that label over the range,
+        from the ``metadata`` sent on calls. ``unit`` and ``run_id`` narrow
+        them.
 
         ``from_`` and ``to`` are days as ``YYYY-MM-DD``, both included; the
         last 30 days by default, at most 90. The answer has ``totals`` and
@@ -772,7 +924,7 @@ class _Usage:
         ``cost_micros``, and the plan's counters (conversations, AI turns,
         API calls, voice minutes).
         """
-        return self._c._json("usage.get", query={"from": from_, "to": to})
+        return self._c._json("usage.get", query={"from": from_, "to": to, "group_by": group_by, "unit": unit, "run_id": run_id})
 
 
 class _Conversations:

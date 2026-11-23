@@ -5,7 +5,13 @@ route added to the platform and not here fails them."""
 
 ROUTES = {
     "whoami": ("GET", "/whoami"),
+    "contract": ("GET", "/contract"),
     "ai.complete": ("POST", "/ai/complete"),
+    "ai.embed": ("POST", "/ai/embeddings"),
+    "ai.models": ("GET", "/ai/models"),
+    "ai.roles.list": ("GET", "/ai/roles"),
+    "ai.roles.set": ("PUT", "/ai/roles/{name}"),
+    "ai.roles.delete": ("DELETE", "/ai/roles/{name}"),
     "knowledge.search": ("POST", "/knowledge/search"),
     "knowledge.documents.list": ("GET", "/knowledge/documents"),
     "knowledge.documents.create": ("POST", "/knowledge/documents"),
@@ -39,39 +45,57 @@ ROUTES = {
     "sessions.bind_credential": ("PUT", "/sessions/{sid}/mcp-credentials/{server}"),
     "sessions.unbind_credential": ("DELETE", "/sessions/{sid}/mcp-credentials/{server}"),
     "usage.get": ("GET", "/usage"),
+    "budgets.list": ("GET", "/budgets"),
+    "budgets.set": ("PUT", "/budgets"),
+    "budgets.delete": ("DELETE", "/budgets/{id}"),
     "mcp": ("POST", "/mcp"),
 }
 
 # Routes that are safe to send again after a 429, a gateway error or a dropped
 # connection: they read, or they compute an answer and change nothing. Placing a
 # call, posting a message, publishing, running an agent turn (which may fire a
-# tool) and writing knowledge are never retried by the client, unless the
+# tool) and adding knowledge are never retried by the client, unless the
 # caller gives the request an idempotency key (IDEMPOTENT below).
 RETRYABLE = frozenset(
     {
         "whoami",
+        "contract",
         "ai.complete",
+        "ai.embed",
+        "ai.models",
+        "ai.roles.list",
+        "ai.roles.set",
         "knowledge.search",
         "knowledge.documents.list",
         "knowledge.documents.get",
+        # Changing a document and deleting one. The same change sent twice
+        # leaves the same document, and a deleted document stays deleted. A
+        # delete sent again after the first one went through answers 404
+        # NOT_FOUND: the document is gone either way.
+        "knowledge.documents.update",
+        "knowledge.documents.delete",
         "knowledge.sources.list",
         "knowledge.export",
         # Reading the agent's settings, and changing them: the same change
         # sent twice leaves the same settings.
         "agent.settings.get",
         "agent.settings.update",
-        # The agent's MCP servers: reads, and a change, which leaves the same
-        # server when it is sent twice. Removing one is not here: a second
-        # delete answers 404 for a server the first one removed.
+        # The agent's MCP servers: reads, a change, which leaves the same
+        # server when it is sent twice, and a removal, which leaves it
+        # removed. A removal sent again after the first one went through
+        # answers 404 NOT_FOUND.
         "agent.mcp_servers.list",
         "agent.mcp_servers.get",
         "agent.mcp_servers.update",
+        "agent.mcp_servers.delete",
         "voice.speak",
         "voice.transcribe",
         "voice.calls.get",
         "voice.jobs.get",
         "customers.get",
         "usage.get",
+        "budgets.list",
+        "budgets.set",
     }
 )
 

@@ -3,18 +3,27 @@ import { McpClient } from './mcp.js'
 import { IDEMPOTENT, RETRYABLE, ROUTES, type RouteName } from './routes.js'
 import { defaultWebSocket, openTranscription, type TranscriptionSession, type WebSocketFactory } from './stt.js'
 import { readSse } from './sse.js'
-import { buildUrl, request, type ResponseInfo, type Transport } from './transport.js'
+import { buildUrl, readInfo, request, type ResponseInfo, type Transport } from './transport.js'
 import type {
   AgentSettings,
   AgentSettingsUpdate,
   AgentTurnRequest,
   AgentTurnResult,
   Block,
+  Budget,
+  BudgetSetRequest,
   CallRequest,
   CallResult,
   CallStatus,
   CompleteRequest,
   CompleteResult,
+  EmbedRequest,
+  EmbedResult,
+  ModelList,
+  RoleDeleted,
+  RoleList,
+  RoleSetRequest,
+  RoleView,
   DocumentInput,
   DocumentPage,
   DocumentPatch,
@@ -26,17 +35,19 @@ import type {
   McpServerInput,
   McpServerUpdate,
   StreamEvent,
+  UsageGrouping,
   UsageRange,
   UsageReport,
   TranscriptionStreamOptions,
   VoiceJobRequest,
   Whoami,
+  CoreRouteContract,
 } from './types.js'
 
 export { OmazyError } from './errors.js'
 export { McpClient, type McpTool, type McpToolResult } from './mcp.js'
 export { ROUTES, RETRYABLE, IDEMPOTENT, WEBSOCKET, type RouteName } from './routes.js'
-export { TranscriptionSession, type SocketLike, type WebSocketFactory } from './stt.js'
+export { TranscriptionSession, ANSWER_TIMEOUT_MS, type AnswerOptions, type SocketLike, type WebSocketFactory } from './stt.js'
 export { readSse, type SseFrame } from './sse.js'
 export type { ResponseInfo } from './transport.js'
 export {
@@ -50,7 +61,7 @@ export {
 export type * from './types.js'
 
 export const DEFAULT_BASE_URL = 'https://mw.omazy.ai/api/v1/core'
-export const VERSION = '0.4.0'
+export const VERSION = '0.5.0'
 
 export interface OmazyOptions {
   /** An install token, `cai_<prefix>.<secret>`. Server side only. */
@@ -110,13 +121,23 @@ export class Omazy {
   private readonly maxRetries: number
   private readonly transport: Transport
   private readonly webSocket: WebSocketFactory
-  /** Headers of the most recent response: request id, rate limit, token deadline. */
+  private readonly opts: OmazyOptions
+  /** Set on a client made by `withResponse`: hands each response on to its parent. */
+  private forward?: (info: ResponseInfo) => void
+  /**
+   * Headers of the most recent response of this client, whichever call it
+   * answered: request id, rate limit, token deadline. When one client serves
+   * several requests at once (a Worker, a server), another call's response can
+   * replace it between your call and your read. Use `withResponse` for the
+   * headers of one call.
+   */
   last: ResponseInfo = { tokenIsPrevious: false, replayed: false }
 
   readonly mcp: McpClient
 
   constructor(opts: OmazyOptions) {
     if (!opts?.token) throw new Error('Omazy: token is required')
+    this.opts = opts
     this.token = opts.token
     this.base = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '')
     this.app = opts.app
@@ -129,6 +150,7 @@ export class Omazy {
       api: 'the Core API',
       onResponse: (info) => {
         this.last = info
+        this.forward?.(info)
       },
     }
     this.webSocket = opts.webSocket ?? defaultWebSocket(this.transport.fetcher)
@@ -139,8 +161,41 @@ export class Omazy {
     )
   }
 
+  /**
+   * Runs `fn` with a client of its own and returns what `fn` returned with the
+   * headers of the last response that client received. Nothing another call
+   * does can change them, so this is the way to read a call's request id or
+   * rate limit when one client serves several requests at once. The client
+   * shares this one's settings, and `last` here still follows every response.
+   *
+   * ```ts
+   * const { result, response } = await omazy.withResponse((o) => o.ai.complete(req))
+   * log(response.requestId, response.rateLimit?.remaining)
+   * ```
+   */
+  async withResponse<T>(fn: (client: Omazy) => Promise<T>): Promise<{ result: T; response: ResponseInfo }> {
+    const child = new Omazy({ ...this.opts, webSocket: this.webSocket })
+    child.forward = (info) => {
+      this.last = info
+      this.forward?.(info)
+    }
+    const result = await fn(child)
+    return { result, response: child.last }
+  }
+
   /** The workspace this token belongs to, its scopes and its deadline. Needs no scope. */
   whoami = () => this.json<Whoami>('whoami')
+
+  /**
+   * The route contract the live platform was built with, or with
+   * `{ format: 'openapi' }` its OpenAPI document. The platform answers it
+   * without a token.
+   */
+  contract = ((opts: { format?: 'routes' | 'openapi' } = {}) =>
+    this.json('contract', { query: { format: opts.format } })) as {
+    (opts?: { format?: 'routes' }): Promise<CoreRouteContract>
+    (opts: { format: 'openapi' }): Promise<Record<string, unknown>>
+  }
 
   readonly ai = {
     /** One model call through the gateway. Needs `ai:complete`. */
@@ -154,6 +209,36 @@ export class Omazy {
      */
     stream: (req: CompleteRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent> =>
       this.stream<CompleteResult>('ai.complete', req, signal),
+
+    /**
+     * Vectors for one text or up to 128, in the order given, with the
+     * deployment's embedding model. Needs `ai:complete`.
+     */
+    embed: (req: EmbedRequest | string | string[], signal?: AbortSignal) => {
+      const body = typeof req === 'string' || Array.isArray(req) ? { input: req } : req
+      return this.json<EmbedResult>('ai.embed', { json: this.withApp(body), signal })
+    },
+
+    /**
+     * The models this install may name, and what each can do: vision, JSON
+     * Schema output, tools, context window. Needs `ai:complete`.
+     */
+    models: (opts: { app?: string } = {}) => this.json<ModelList>('ai.models', { query: { app: opts.app ?? this.app } }),
+
+    /**
+     * Model roles. A call names one with `model: 'role:extract.fast'`; these
+     * say what each role runs on here and map one for this install or the
+     * workspace.
+     */
+    roles: {
+      /** Every role this install can name and what it runs on. Needs `ai:complete`. */
+      list: (opts: { app?: string } = {}) => this.json<RoleList>('ai.roles.list', { query: { app: opts.app ?? this.app } }),
+      /** Map a role to a model and up to three fallbacks, all on the plan. Needs `ai:configure`. */
+      set: (name: string, req: RoleSetRequest) => this.json<RoleView>('ai.roles.set', { path: { name }, json: req }),
+      /** Remove the install's (or the workspace's) mapping of a role. Needs `ai:configure`. */
+      delete: (name: string, opts: { level?: 'install' | 'workspace' } = {}) =>
+        this.json<RoleDeleted>('ai.roles.delete', { path: { name }, query: { level: opts.level } }),
+    },
   }
 
   readonly knowledge = {
@@ -182,10 +267,17 @@ export class Omazy {
           json: this.withApp(doc),
           idempotencyKey: opts.idempotencyKey,
         }),
-      /** Change the fields given and index the document again. Needs `kb:write`. */
+      /**
+       * Change the fields given and index the document again. The same change
+       * sent twice leaves the same document, so the client retries it like a
+       * read. Needs `kb:write`.
+       */
       update: (id: string, patch: DocumentPatch) =>
         this.json<KnowledgeDocument>('knowledge.documents.update', { path: { id }, json: this.withApp(patch) }),
-      /** Delete a document. The agent stops using it. Needs `kb:write`. */
+      /**
+       * Delete a document. The agent stops using it. Retried like a read: when
+       * a retry answers `NOT_FOUND`, an earlier attempt deleted it. Needs `kb:write`.
+       */
       delete: (id: string, opts: { app?: string } = {}) =>
         this.json<{ id: string; deleted: boolean }>('knowledge.documents.delete', {
           path: { id },
@@ -311,7 +403,10 @@ export class Omazy {
       update: (id: string, req: McpServerUpdate) =>
         this.json<McpServer>('agent.mcp_servers.update', { path: { id }, json: this.withApp(req) }),
 
-      /** Removes a server and its stored credential. Never sent twice by the client. */
+      /**
+       * Removes a server and its stored credential. Retried like a read: when a
+       * retry answers `NOT_FOUND`, an earlier attempt removed it.
+       */
       delete: (id: string, opts: { app?: string } = {}) =>
         this.json<{ id: string; deleted: true }>('agent.mcp_servers.delete', { path: { id }, query: { app: opts.app ?? this.app } }),
     },
@@ -403,13 +498,30 @@ export class Omazy {
       this.json<Json>('sessions.unbind_credential', { path: { sid: sessionId, server } }),
   }
 
+  /**
+   * Spend caps on this install, held before the call: a completion, an
+   * embedding or an agent turn past a cap that covers it is refused with 402
+   * `BUDGET_EXCEEDED` before any model runs.
+   */
+  readonly budgets = {
+    /** The caps with this period's spend. Needs `usage:read`. */
+    list: () => this.json<{ budgets: Budget[] }>('budgets.list'),
+    /** Add a cap, or change the limit of the one with the same label, value and period. Needs `ai:configure`. */
+    set: (req: BudgetSetRequest) => this.json<Budget>('budgets.set', { json: req }),
+    /** Remove a cap. Needs `ai:configure`. */
+    delete: (id: string) => this.json<{ id: string; deleted: true }>('budgets.delete', { path: { id } }),
+  }
+
   readonly usage = {
     /**
      * What the workspace used and what it cost, per UTC day: model calls,
      * cache hits, tokens, speech, cost, and the plan's counters. The last 30
      * days by default, at most 90. Needs `usage:read`.
      */
-    get: (range: UsageRange = {}) => this.json<UsageReport>('usage.get', { query: { from: range.from, to: range.to } }),
+    get: (range: UsageRange & UsageGrouping = {}) =>
+      this.json<UsageReport>('usage.get', {
+        query: { from: range.from, to: range.to, group_by: range.group_by, unit: range.unit, run_id: range.run_id },
+      }),
   }
 
   private withApp<T extends object>(req: T): T {
@@ -423,7 +535,9 @@ export class Omazy {
       { json: this.withApp({ ...req, stream: true }), signal, headers: { accept: 'text/event-stream' } },
       0,
     )
-    if (!res.body) throw new OmazyError('the stream had no body', res.status, 'STREAM_ERROR', this.last.requestId)
+    // This response's own id: `last` may already belong to another call.
+    const requestId = readInfo(res.headers).requestId
+    if (!res.body) throw new OmazyError('the stream had no body', res.status, 'STREAM_ERROR', requestId)
     for await (const frame of readSse(res.body)) {
       if (frame.event === 'delta') {
         yield { type: 'delta', text: (JSON.parse(frame.data) as { text: string }).text }
@@ -432,10 +546,10 @@ export class Omazy {
         return
       } else if (frame.event === 'error') {
         const e = JSON.parse(frame.data) as { message?: string; code?: string }
-        throw new OmazyError(e.message ?? 'the stream failed', res.status, e.code ?? 'STREAM_ERROR', this.last.requestId)
+        throw new OmazyError(e.message ?? 'the stream failed', res.status, e.code ?? 'STREAM_ERROR', requestId)
       }
     }
-    throw new OmazyError('the stream ended before it was done', res.status, 'STREAM_ERROR', this.last.requestId)
+    throw new OmazyError('the stream ended before it was done', res.status, 'STREAM_ERROR', requestId)
   }
 
   /** Sends a request and unwraps `{ success, data }`. */

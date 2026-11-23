@@ -82,11 +82,18 @@ export class OmazyEnterprise {
   private readonly maxRetries: number
   private readonly transport: Transport
   private readonly coreOptions: Pick<OmazyOptions, 'baseUrl' | 'fetch'>
-  /** Headers of the most recent response: request id and the key's deadline. */
+  private readonly opts: OmazyEnterpriseOptions
+  private forward?: (info: ResponseInfo) => void
+  /**
+   * Headers of the most recent response of this client, whichever call it
+   * answered: request id and the key's deadline. Calls made at once can
+   * replace it before you read it; `withResponse` gives one call's headers.
+   */
   last: ResponseInfo = { tokenIsPrevious: false, replayed: false }
 
   constructor(opts: OmazyEnterpriseOptions) {
     if (!opts?.token) throw new Error('OmazyEnterprise: token is required')
+    this.opts = opts
     this.base = (opts.baseUrl ?? DEFAULT_ENTERPRISE_BASE_URL).replace(/\/+$/, '')
     this.maxRetries = opts.maxRetries ?? 2
     this.transport = {
@@ -97,6 +104,7 @@ export class OmazyEnterprise {
       api: 'the Enterprise API',
       onResponse: (info) => {
         this.last = info
+        this.forward?.(info)
       },
     }
     // The Core API of the same deployment: .../enterprise becomes .../core.
@@ -121,6 +129,9 @@ export class OmazyEnterprise {
         external_id: q.external_id,
         cursor: q.cursor,
         limit: q.limit ? String(q.limit) : undefined,
+        group_by: q.group_by,
+        unit: q.unit,
+        run_id: q.run_id,
       },
     })
     const body = (await res.json()) as { data?: Omit<AccountUsage, 'next_cursor'>; meta?: { next_cursor?: string } }
@@ -174,6 +185,21 @@ export class OmazyEnterprise {
      */
     rotateInstall: (id: string, req: RotateInstallRequest = {}) =>
       this.json<RotateInstallResult>('workspaces.rotate_install', { path: { id }, json: req }),
+  }
+
+  /**
+   * Runs `fn` with a client of its own and returns what `fn` returned with the
+   * headers of the last response that client received, which no other call
+   * can change. `last` here still follows every response.
+   */
+  async withResponse<T>(fn: (client: OmazyEnterprise) => Promise<T>): Promise<{ result: T; response: ResponseInfo }> {
+    const child = new OmazyEnterprise(this.opts)
+    child.forward = (info) => {
+      this.last = info
+      this.forward?.(info)
+    }
+    const result = await fn(child)
+    return { result, response: child.last }
   }
 
   /**

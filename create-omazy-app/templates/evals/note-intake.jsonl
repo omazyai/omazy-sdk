@@ -1,0 +1,2 @@
+// The actor's conversations: the person's turns and what should come of them.
+{"id": "one_turn", "input": {"turns": ["Add a note: call the plumber"]}, "expected": {"slots": {"title": "call the plumber"}, "state": "confirm"}, "fake": [{"output": {"items": [{"slot": "title", "value": "call the plumber", "confidence": 0.95, "evidence": "call the plumber", "from": "message"}]}}]}

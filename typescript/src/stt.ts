@@ -52,6 +52,41 @@ async function refusal(res: Response): Promise<OmazyError> {
 
 type Waiter<T> = { resolve: (v: T) => void; reject: (e: OmazyError) => void }
 
+/** How long `commit()` and `end()` wait for their answer unless told otherwise. */
+export const ANSWER_TIMEOUT_MS = 30_000
+
+/** Options for `commit()` and `end()`. */
+export interface AnswerOptions {
+  /** Give up waiting for the answer after this long. Default 30 s. */
+  timeoutMs?: number
+}
+
+/**
+ * A waiter that gives up after `ms`. It keeps its place in the queue: an
+ * answer that arrives late is still this call's, and is dropped.
+ */
+function timed<T>(resolve: (v: T) => void, reject: (e: OmazyError) => void, ms: number, fail: () => OmazyError): Waiter<T> {
+  let settled = false
+  const timer = setTimeout(() => {
+    settled = true
+    reject(fail())
+  }, ms)
+  return {
+    resolve: (v) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(v)
+    },
+    reject: (e) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      reject(e)
+    },
+  }
+}
+
 /**
  * One live transcription. Send audio as it is captured; `commit()` after each
  * utterance (a button let go) resolves with its text; `end()` finishes the
@@ -95,11 +130,15 @@ export class TranscriptionSession {
     this.ws.send(audio)
   }
 
-  /** Ends the current utterance and keeps the session open. Resolves with its final, whose text may be empty. */
-  commit(): Promise<TranscriptFinal> {
+  /**
+   * Ends the current utterance and keeps the session open. Resolves with its
+   * final, whose text may be empty. Rejects with `STREAM_ERROR` when no answer
+   * comes within `timeoutMs` (default 30 s).
+   */
+  commit(opts: AnswerOptions = {}): Promise<TranscriptFinal> {
     return new Promise((resolve, reject) => {
       if (this.failure) return reject(this.failure)
-      this.commits.push({ resolve, reject })
+      this.commits.push(timed(resolve, reject, opts.timeoutMs ?? ANSWER_TIMEOUT_MS, () => this.late('commit', opts)))
       this.ws.send(JSON.stringify({ type: 'commit' }))
     })
   }
@@ -109,13 +148,22 @@ export class TranscriptionSession {
     this.ws.send(JSON.stringify({ type: 'keepalive' }))
   }
 
-  /** No more audio. Resolves with the whole transcript; the socket then closes. */
-  end(): Promise<TranscriptionDone> {
+  /**
+   * No more audio. Resolves with the whole transcript; the socket then closes.
+   * Rejects with `STREAM_ERROR` when no answer comes within `timeoutMs`
+   * (default 30 s).
+   */
+  end(opts: AnswerOptions = {}): Promise<TranscriptionDone> {
     return new Promise((resolve, reject) => {
       if (this.failure) return reject(this.failure)
-      this.done = { resolve, reject }
+      this.done = timed(resolve, reject, opts.timeoutMs ?? ANSWER_TIMEOUT_MS, () => this.late('end', opts))
       this.ws.send(JSON.stringify({ type: 'end' }))
     })
+  }
+
+  private late(what: string, opts: AnswerOptions): OmazyError {
+    const s = (opts.timeoutMs ?? ANSWER_TIMEOUT_MS) / 1000
+    return new OmazyError(`no answer to ${what} in ${s} s`, 0, 'STREAM_ERROR', this.requestId)
   }
 
   /** Closes the socket without waiting for an answer. */

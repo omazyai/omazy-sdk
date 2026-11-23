@@ -1,8 +1,11 @@
 package omazy
 
 import (
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 )
 
 const settingsJSON = `{"app_id":"a1","app":"acme",` +
@@ -77,5 +80,18 @@ func TestAModelThatCannotBeSetIsAnErrorWithItsCode(t *testing.T) {
 		if !errors.As(err, &apiErr) || apiErr.Status != status || apiErr.Code != code || len(f.seen) != 1 {
 			t.Fatalf("%d: %v, sent %d times", status, err, len(f.seen))
 		}
+	}
+}
+
+func TestCacheTTLHelpersSendSeconds(t *testing.T) {
+	if got := NoCache(); got == nil || *got != 0 {
+		t.Fatalf("NoCache: %v", got)
+	}
+	if got := CacheFor(5 * time.Minute); got == nil || *got != 300 {
+		t.Fatalf("CacheFor: %v", got)
+	}
+	b, _ := json.Marshal(CompleteRequest{Messages: []Message{{Role: "user", Content: "hi"}}, CacheTTL: NoCache()})
+	if !strings.Contains(string(b), `"cache_ttl":0`) {
+		t.Fatalf("a zero TTL must be sent: %s", b)
 	}
 }

@@ -3,12 +3,14 @@ import pathlib
 import sys
 import threading
 import unittest
+from unittest import mock
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
-from omazy import IDEMPOTENT, RETRYABLE, ROUTES, WEBSOCKET, Omazy, OmazyError, sign, verify_signature  # noqa: E402
+from omazy import IDEMPOTENT, RETRYABLE, ROUTES, WEBSOCKET, Omazy, OmazyError, ResponseInfo, sign, verify_signature  # noqa: E402
+from omazy import client as omazy_client  # noqa: E402
 
 # hmac-sha256('s3cret', '{"a":1}') in hex, computed with openssl. The three SDKs
 # test against the same vector.
@@ -112,7 +114,13 @@ class ContractTest(Base):
         self.api.answers = [lambda path: rpc({"tools": []}) if path.endswith("/mcp") else ok({"passages": []})]
         o = self.client()
         o.whoami()
+        o.contract()
         o.ai.complete([{"role": "user", "content": "hi"}])
+        o.ai.embed("hi")
+        o.ai.models()
+        o.ai.roles.list()
+        o.ai.roles.set("c1", "openai/gpt-4o")
+        o.ai.roles.delete("c1")
         o.knowledge.search("q")
         o.knowledge.documents.list()
         o.knowledge.documents.create("t", "c")
@@ -145,10 +153,13 @@ class ContractTest(Base):
         o.sessions.bind_credential("s1", "erp", "t", "2027-01-01T00:00:00Z", {})
         o.sessions.unbind_credential("s1", "erp")
         o.usage.get()
+        o.budgets.list()
+        o.budgets.set("day", 5)
+        o.budgets.delete("c1")
         o.mcp.list_tools()
 
         used = {(s["method"], s["path"].split("?")[0].replace("/core", "", 1)) for s in self.api.seen}
-        fill = {"{ref}": "r1", "{sid}": "s1", "{server}": "erp"}
+        fill = {"{ref}": "r1", "{sid}": "s1", "{server}": "erp", "{name}": "c1"}
         for name, (method, path) in ROUTES.items():
             if name in WEBSOCKET:
                 continue  # opened on a real socket in test_transcribe_stream.py
@@ -160,10 +171,20 @@ class ContractTest(Base):
     def test_nothing_that_changes_the_world_is_retried(self):
         for name in (
             "voice.calls.place", "conversations.post_message", "channels.linkedin_publish", "agent.turn", "customers.update",
-            "voice.jobs.create", "mcp", "knowledge.documents.create", "knowledge.documents.update", "knowledge.documents.delete",
+            "voice.jobs.create", "mcp", "knowledge.documents.create",
             "knowledge.import_file", "knowledge.sources.create", "knowledge.sources.crawl",
         ):
             self.assertNotIn(name, RETRYABLE)
+
+
+class LiveContractTest(Base):
+    def test_contract_reads_the_route_contract_or_the_openapi_document(self):
+        self.api.answers = [ok({"base": "/api/v1/core", "routes": [{"method": "GET", "path": "/whoami", "scope": "", "sdk": "whoami"}]})]
+        got = self.client().contract()
+        self.assertEqual(got["routes"][0]["sdk"], "whoami")
+        self.client().contract(format="openapi")
+        self.assertEqual(self.api.seen[0]["path"], "/core/contract")
+        self.assertEqual(self.api.seen[1]["path"], "/core/contract?format=openapi")
 
 
 class KnowledgeTest(Base):
@@ -201,8 +222,19 @@ class KnowledgeTest(Base):
     def test_a_write_that_is_refused_is_not_sent_again(self):
         self.api.answers = [fail(503, "UPSTREAM_UNAVAILABLE", "try later")]
         with self.assertRaises(OmazyError):
-            self.client().knowledge.documents.delete("01A")
+            self.client().knowledge.sources.crawl("s1")
         self.assertEqual(len(self.api.seen), 1)
+
+    def test_a_change_and_a_delete_are_sent_again(self):
+        self.api.answers = [fail(503, "UPSTREAM_UNAVAILABLE", "busy", **{"Retry-After": "1"}), ok({"id": "01A", "is_active": False})]
+        self.assertEqual(self.client().knowledge.documents.update("01A", is_active=False)["id"], "01A")
+        self.assertEqual([s["method"] for s in self.api.seen], ["PATCH", "PATCH"])
+        self.api.seen.clear()
+        self.api.answers = [fail(502, "BAD_GATEWAY", "lost", **{"Retry-After": "1"}), fail(404, "NOT_FOUND", "document not found")]
+        with self.assertRaises(OmazyError) as cm:
+            self.client().knowledge.documents.delete("01A")
+        self.assertEqual(cm.exception.code, "NOT_FOUND")
+        self.assertEqual([s["method"] for s in self.api.seen], ["DELETE", "DELETE"])
 
     def test_a_rate_limited_read_is_sent_again(self):
         self.api.answers = [fail(429, "RATE_LIMITED", "slow down", **{"Retry-After": "1"}), ok({"documents": [], "next_cursor": "", "version": 3})]
@@ -244,6 +276,60 @@ class RequestTest(Base):
         self.assertEqual((o.last.request_id, o.last.rate_limit, o.last.rate_remaining, o.last.rate_reset_seconds), ("req_9", 600, 12, 3))
         self.assertTrue(o.last.token_is_previous)
         self.assertEqual(o.last.token_expires_at, "2026-12-01T00:00:00Z")
+
+    def test_with_response_keeps_each_threads_own_headers(self):
+        # The slow call is answered after the fast one, so last ends on it while
+        # each thread's block keeps the answer to its own call.
+        slow_started = threading.Event()
+
+        def answer(path):
+            name = path.rsplit("/", 1)[-1]
+            if name == "slow":
+                slow_started.set()
+                fast_done.wait(5)
+            return ok({"id": name}, **{"X-Request-Id": "req_" + name, "X-RateLimit-Limit": "600", "X-RateLimit-Remaining": "9" if name == "slow" else "8"})
+
+        fast_done = threading.Event()
+        self.api.answers = [answer]
+        o = self.client()
+        got = {}
+
+        def call(name):
+            with o.with_response() as response:
+                if name == "fast":
+                    slow_started.wait(5)
+                o.knowledge.documents.get(name)
+                if name == "fast":
+                    fast_done.set()
+            got[name] = response
+
+        threads = [threading.Thread(target=call, args=(n,)) for n in ("slow", "fast")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual((got["slow"].request_id, got["slow"].rate_remaining), ("req_slow", 9))
+        self.assertEqual((got["fast"].request_id, got["fast"].rate_remaining), ("req_fast", 8))
+        self.assertEqual(o.last.request_id, "req_slow")
+
+    def test_with_response_sees_only_its_own_client_and_refusals(self):
+        self.api.answers = [ok({}, **{"X-Request-Id": "req_a"}), fail(403, "FORBIDDEN", "no", **{"X-Request-Id": "req_b"})]
+        a, b = self.client(), self.client()
+        with a.with_response() as response:
+            a.whoami()
+            with self.assertRaises(OmazyError):
+                b.whoami()
+        self.assertEqual(response.request_id, "req_a")
+        self.assertEqual(b.last.request_id, "req_b")
+
+    def test_a_stream_error_carries_its_own_request_id(self):
+        self.api.answers = [(200, {"X-Request-Id": "req_s1"}, [b'event: error\ndata: {"code":"UPSTREAM_REJECTED","message":"no"}\n\n'])]
+        o = self.client()
+        # Another thread's response replaces last as soon as this one lands.
+        other = lambda c, info: setattr(c, "last", ResponseInfo(request_id="someone_else"))  # noqa: E731
+        with mock.patch.object(omazy_client, "_record", other), self.assertRaises(OmazyError) as cm:
+            list(o.ai.stream([{"role": "user", "content": "x"}]))
+        self.assertEqual((cm.exception.code, cm.exception.request_id), ("UPSTREAM_REJECTED", "req_s1"))
 
     def test_speak_returns_audio_and_language(self):
         self.api.answers = [(200, {"Content-Type": "audio/wav", "X-Omazy-Speech-Lang": "bn"}, b"RIFFdata")]

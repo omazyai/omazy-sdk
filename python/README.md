@@ -5,7 +5,7 @@ Python client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/
 ## Install
 
 ```sh
-pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.4.0/omazy-0.4.0-py3-none-any.whl
+pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.0/omazy-0.5.0-py3-none-any.whl
 ```
 
 ## Use
@@ -176,7 +176,7 @@ except OmazyError as e:
     raise
 ```
 
-`e.status`, `e.code`, `e.message`, `e.request_id` and `e.retry_after` are set from the response. After any call, `omazy.last` holds the request id, the rate limit and the token's deadline.
+`e.status`, `e.code`, `e.message`, `e.request_id` and `e.retry_after` are set from the response. `with omazy.with_response() as response:` gives the request id, the rate limit and the token's deadline of the calls made inside the block by this thread, which other threads never change. `omazy.last` holds the same for the client's most recent response, whichever call it answered, so with threads sharing a client it can belong to another thread's call.
 
 ## One workspace per customer
 

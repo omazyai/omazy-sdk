@@ -31,7 +31,7 @@ const (
 	// DefaultBaseURL is the production Core API.
 	DefaultBaseURL = "https://mw.omazy.ai/api/v1/core"
 	// Version of this client.
-	Version = "0.4.0"
+	Version = "0.5.0"
 )
 
 // Error is a refusal or failure from the Core API. Branch on Code, log Message.
@@ -86,6 +86,7 @@ type Client struct {
 	Channels      *ChannelsService
 	Sessions      *SessionsService
 	Usage         *UsageService
+	Budgets       *BudgetService
 	MCP           *MCPService
 }
 
@@ -130,10 +131,14 @@ func New(token string, opts ...Option) *Client {
 	c.Voice, c.Customers, c.Conversations = &VoiceService{c}, &CustomersService{c}, &ConversationsService{c}
 	c.Channels, c.Sessions, c.MCP = &ChannelsService{c}, &SessionsService{c}, &MCPService{c: c}
 	c.Usage = &UsageService{c}
+	c.Budgets = &BudgetService{c}
 	return c
 }
 
-// Last returns the headers of the most recent response.
+// Last returns the headers of the most recent response of this client,
+// whichever call it answered. When goroutines share the client, another call's
+// response can replace them between your call and your read: use
+// WithResponseInfo for the headers of one call.
 func (c *Client) Last() ResponseInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -145,6 +150,34 @@ func (c *Client) Last() ResponseInfo {
 func (c *Client) Whoami(ctx context.Context) (*Whoami, error) {
 	var out Whoami
 	return &out, c.json(ctx, "whoami", call{}, &out)
+}
+
+// Contract returns the route contract the live platform was built with. The
+// platform answers it without a token.
+func (c *Client) Contract(ctx context.Context) (*RouteContract, error) {
+	var out RouteContract
+	return &out, c.json(ctx, "contract", call{}, &out)
+}
+
+// ContractOpenAPI returns the live platform's OpenAPI document, as JSON.
+func (c *Client) ContractOpenAPI(ctx context.Context) (json.RawMessage, error) {
+	var out json.RawMessage
+	return out, c.json(ctx, "contract", call{query: map[string]string{"format": "openapi"}}, &out)
+}
+
+type responseInfoKey struct{}
+
+// WithResponseInfo returns a context that has a call made with it write its
+// response headers into dst: the request id, the rate limit, the token's
+// deadline and whether the answer was a replay. dst belongs to that call
+// alone, so other goroutines sharing the client never change it. It is
+// written on a refusal too. Last still follows every response.
+//
+//	var info omazy.ResponseInfo
+//	res, err := c.AI.Complete(omazy.WithResponseInfo(ctx, &info), req)
+//	log.Println(info.RequestID, info.RateRemaining)
+func WithResponseInfo(ctx context.Context, dst *ResponseInfo) context.Context {
+	return context.WithValue(ctx, responseInfoKey{}, dst)
 }
 
 type idempotencyKey struct{}
@@ -191,7 +224,7 @@ func (c *Client) json(ctx context.Context, name string, in call, out any) error 
 		Data json.RawMessage `json:"data"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
-		return &Error{Status: res.StatusCode, Code: "BAD_RESPONSE", Message: "the response was not JSON: " + err.Error(), RequestID: c.Last().RequestID}
+		return &Error{Status: res.StatusCode, Code: "BAD_RESPONSE", Message: "the response was not JSON: " + err.Error(), RequestID: res.Header.Get("X-Request-Id")}
 	}
 	if out == nil || len(env.Data) == 0 {
 		return nil
@@ -284,6 +317,9 @@ func (c *Client) do(ctx context.Context, r route, in call, attempts int, key, ap
 		c.mu.Lock()
 		c.last = info
 		c.mu.Unlock()
+		if dst, ok := ctx.Value(responseInfoKey{}).(*ResponseInfo); ok && dst != nil {
+			*dst = info
+		}
 		if res.StatusCode >= 200 && res.StatusCode < 300 {
 			return res, nil
 		}
@@ -394,7 +430,8 @@ func (c *Client) streamEvents(ctx context.Context, route string, body any, onDel
 		return err
 	}
 	defer res.Body.Close()
-	requestID := c.Last().RequestID
+	// This response's own id: Last may already belong to another call.
+	requestID := res.Header.Get("X-Request-Id")
 	fail := func(code, msg string) *Error {
 		return &Error{Status: res.StatusCode, Code: code, Message: msg, RequestID: requestID}
 	}
@@ -540,14 +577,17 @@ func (s *KnowledgeService) CreateDocument(ctx context.Context, in DocumentInput)
 }
 
 // UpdateDocument changes the fields given and indexes the document again.
-// Needs kb:write.
+// The same change sent twice leaves the same document, so the client retries
+// it like a read. Needs kb:write.
 func (s *KnowledgeService) UpdateDocument(ctx context.Context, id string, patch DocumentPatch) (*Document, error) {
 	patch.App = s.c.appOr(patch.App)
 	var out Document
 	return &out, s.c.json(ctx, "knowledge.documents.update", call{path: map[string]string{"id": id}, body: patch}, &out)
 }
 
-// DeleteDocument deletes a document. The agent stops using it. Needs kb:write.
+// DeleteDocument deletes a document. The agent stops using it. Retried like a
+// read: when a retry answers NOT_FOUND, an earlier attempt deleted it. Needs
+// kb:write.
 func (s *KnowledgeService) DeleteDocument(ctx context.Context, id, app string) error {
 	return s.c.json(ctx, "knowledge.documents.delete", call{path: map[string]string{"id": id}, query: map[string]string{"app": s.c.appOr(app)}}, nil)
 }
@@ -688,8 +728,8 @@ func (s *AgentService) UpdateMCPServer(ctx context.Context, id string, req MCPSe
 	return &out, s.c.json(ctx, "agent.mcp_servers.update", call{path: map[string]string{"id": id}, body: req}, &out)
 }
 
-// DeleteMCPServer removes a server and its stored credential. Never sent twice
-// by the client. Needs agent:tools.
+// DeleteMCPServer removes a server and its stored credential. Retried like a
+// read: when a retry answers NOT_FOUND, an earlier attempt removed it.
 func (s *AgentService) DeleteMCPServer(ctx context.Context, id, app string) error {
 	return s.c.json(ctx, "agent.mcp_servers.delete", call{path: map[string]string{"id": id}, query: map[string]string{"app": s.c.appOr(app)}}, nil)
 }

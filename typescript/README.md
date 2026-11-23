@@ -1,6 +1,6 @@
 # @omazyai/sdk
 
-TypeScript client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/). No dependencies. Runs on Node 18+, Bun, Deno and Cloudflare Workers.
+TypeScript client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/). No dependencies. Runs on Node 20+, Bun, Deno and Cloudflare Workers.
 
 ## Install
 
@@ -18,7 +18,7 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.4.0/omazyai-sdk-0.4.0.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.0/omazyai-sdk-0.5.0.tgz
 ```
 
 ## Use
@@ -183,7 +183,7 @@ try {
 }
 ```
 
-`e.status`, `e.code`, `e.message`, `e.requestId` and `e.retryAfter` are set from the response. After any call, `omazy.last` holds the request id, the rate limit and the token's deadline.
+`e.status`, `e.code`, `e.message`, `e.requestId` and `e.retryAfter` are set from the response. `omazy.withResponse((o) => o.ai.complete(req))` resolves with `{ result, response }`: `response` holds the request id, the rate limit and the token's deadline of that call alone. `omazy.last` holds the same for the client's most recent response, whichever call it answered, so in a Worker or a server that runs requests at once it can belong to another request. Read it only where one call runs at a time.
 
 ## MCP
 

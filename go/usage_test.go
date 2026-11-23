@@ -21,3 +21,14 @@ func TestUsageIsRead(t *testing.T) {
 		t.Fatalf("default range: %v %+v", err, f.seen[1])
 	}
 }
+
+func TestContractIsRead(t *testing.T) {
+	f, c := newFake(t, ok(`{"base":"/api/v1/core","routes":[{"method":"GET","path":"/contract","scope":"","sdk":"contract","public":true}]}`))
+	got, err := c.Contract(ctx)
+	if err != nil || len(got.Routes) != 1 || !got.Routes[0].Public || got.Routes[0].SDK != "contract" {
+		t.Fatalf("contract: %v %+v", err, got)
+	}
+	if _, err := c.ContractOpenAPI(ctx); err != nil || f.seen[0].path != "/core/contract" || f.seen[1].path != "/core/contract?format=openapi" {
+		t.Fatalf("requests: %v %+v", err, f.seen)
+	}
+}

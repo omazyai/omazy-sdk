@@ -1,11 +1,12 @@
 """Client for the Omazy Enterprise API: one workspace per customer. Standard library only."""
 
+import contextlib
 import json
 import time
 import urllib.request
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 
-from .client import DEFAULT_BASE_URL, VERSION, Omazy, ResponseInfo, _build_url, _drop_none, _request
+from .client import DEFAULT_BASE_URL, VERSION, Omazy, ResponseInfo, _build_url, _drop_none, _request, _with_response
 
 DEFAULT_ENTERPRISE_BASE_URL = "https://mw.omazy.ai/api/v1/enterprise"
 
@@ -78,10 +79,16 @@ class OmazyEnterprise:
         # The Core API of the same deployment: .../enterprise becomes .../core.
         suffix = "/enterprise"
         self._core_base = self._base[: -len(suffix)] + "/core" if self._base.endswith(suffix) else DEFAULT_BASE_URL
-        #: Headers of the most recent response.
+        #: Headers of the most recent response of this client, whichever call
+        #: it answered. Use ``with_response`` for the headers of your own calls.
         self.last = ResponseInfo()
 
         self.workspaces = _Workspaces(self)
+
+    def with_response(self) -> "contextlib.AbstractContextManager[ResponseInfo]":
+        """The headers of the calls made inside the block, by this thread,
+        which calls from other threads never change. See ``Omazy.with_response``."""
+        return _with_response(self)
 
     def account(self) -> Json:
         """The account behind the key, its limits, how many workspaces it manages, and the key. Needs no scope."""
@@ -95,8 +102,14 @@ class OmazyEnterprise:
         external_id: Optional[str] = None,
         limit: Optional[int] = None,
         cursor: Optional[str] = None,
+        group_by: Optional[str] = None,
+        unit: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> Json:
-        """Usage and cost per UTC day of one page of the account's workspaces,
+        """``group_by``, ``unit`` and ``run_id`` add ``groups`` over every
+        workspace of the account, as ``Omazy.usage.get`` does for one.
+
+        Usage and cost per UTC day of one page of the account's workspaces,
         with the account's totals over all of them:
         ``{"from", "to", "totals", "workspaces": [...], "next_cursor"}``.
         ``next_cursor`` is absent on the last page. The last 30 days by
@@ -110,6 +123,9 @@ class OmazyEnterprise:
                 "external_id": external_id,
                 "cursor": cursor,
                 "limit": str(limit) if limit else None,
+                "group_by": group_by,
+                "unit": unit,
+                "run_id": run_id,
             },
         )
         out: Json = dict(res.get("data") or {})

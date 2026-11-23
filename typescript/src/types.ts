@@ -2,7 +2,26 @@ export interface Usage {
   input_tokens: number
   output_tokens: number
   cached_input_tokens: number
+  /**
+   * What the call cost in millionths of a US dollar, priced from the rate
+   * card the cost ledger uses; 0 for a reply from the response cache. Set on
+   * `ai.complete`.
+   */
+  cost_micros?: number
 }
+
+/**
+ * Labels kept in the cost ledger on every model call the request makes, and
+ * reported by `usage.get({ group_by })`. `unit`, `unit_version`,
+ * `prompt_version` and `run_id` (at most 128 bytes each), plus up to 8 keys of
+ * your own (lower case, at most 40 characters, values at most 200 bytes).
+ */
+export type Metadata = {
+  unit?: string
+  unit_version?: string
+  prompt_version?: string
+  run_id?: string
+} & Record<string, string | number | boolean>
 
 export interface ToolCall {
   id: string
@@ -16,12 +35,36 @@ export interface ToolResult {
   is_error?: boolean
 }
 
+/**
+ * An image on a user message: a public https URL the provider fetches, or the
+ * bytes as standard base64 (no `data:` prefix) with their media type. At most
+ * 8 on a message, 16 on a call, 5 MB each.
+ */
+export type Image =
+  | { url: string }
+  | { data: string; media_type: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp' }
+
 export interface Message {
   role: 'user' | 'assistant'
+  /** Can be empty on a turn that carries images, tool calls or tool results. */
   content: string
   tool_calls?: ToolCall[]
   tool_results?: ToolResult[]
+  /** Images for the model to read, on a user turn. The model must have `vision`. */
+  images?: Image[]
 }
+
+/**
+ * Asks for a JSON reply. `json_schema` holds it to `schema`; with `strict`
+ * every object must be closed and every property required.
+ */
+export type ResponseFormat =
+  | { type: 'text' }
+  | { type: 'json_object' }
+  | { type: 'json_schema'; json_schema: { name?: string; schema: Record<string, unknown>; strict?: boolean } }
+
+/** `auto`, `any`, `none`, or one named tool the model must call. */
+export type ToolChoice = 'auto' | 'any' | 'none' | { type: 'tool'; name: string }
 
 export interface ToolDefinition {
   name: string
@@ -35,10 +78,18 @@ export interface CompleteRequest {
   system?: string
   messages: Message[]
   tools?: ToolDefinition[]
-  tool_choice?: 'auto' | 'any' | 'none'
-  /** A model id with its provider, such as openai/gpt-4o-mini. */
+  tool_choice?: ToolChoice
+  /**
+   * A JSON reply, held to a schema with `json_schema`. The result's `text` is
+   * the JSON and `output` the parsed value. A model that cannot is a 422
+   * `MODEL_UNSUPPORTED`; see `ai.models()`.
+   */
+  response_format?: ResponseFormat
+  /** A model id with its provider, such as openai/gpt-4o-mini, or a role: `role:extract.fast`. */
   model?: string
   profile?: string
+  /** Labels for the cost ledger. */
+  metadata?: Metadata
   max_tokens?: number
   temperature?: number
   /**
@@ -58,6 +109,127 @@ export interface CompleteResult {
   usage: Usage
   /** True when the reply came from the gateway's response cache: no model call, no cost, no AI turn. */
   cache_hit?: boolean
+  /** The reply as JSON, checked against the schema, when the request set `response_format`. */
+  output?: unknown
+  /** The model role the request named; `model` is then the model that answered. */
+  role?: string
+}
+
+/** POST /ai/embeddings. */
+export interface EmbedRequest {
+  /** One text, or up to 128. Each at most 8000 bytes. */
+  input: string | string[]
+  /** Left out, the deployment's embedding model (`ai.models()`, kind `embedding`). */
+  model?: string
+  app?: string
+  metadata?: Metadata
+}
+
+export interface Embedding {
+  /** The input's place in the request. */
+  index: number
+  embedding: number[]
+}
+
+export interface EmbedResult {
+  model: string
+  dimensions: number
+  /** One per input, in the order of the inputs. */
+  embeddings: Embedding[]
+  usage: { input_tokens: number; estimated?: boolean; cost_micros: number }
+}
+
+export interface ModelCapabilities {
+  /** Reads `images` on a message. */
+  vision: boolean
+  /** Takes `response_format` with a JSON Schema. */
+  json_schema: boolean
+  /** The provider enforces the schema itself; otherwise a forced tool does, and `tools` cannot be combined with it. */
+  json_schema_native: boolean
+  tools: boolean
+  context_tokens?: number
+  /** On an embedding model, its vector length. */
+  dimensions?: number
+}
+
+export interface ModelInfo {
+  /** What `model` takes on a call. */
+  id: string
+  label?: string
+  vendor?: string
+  kind: 'chat' | 'embedding'
+  tier?: 'standard' | 'premium'
+  source?: 'managed' | 'byo'
+  default?: boolean
+  capabilities: ModelCapabilities
+}
+
+/**
+ * A spend cap on the install: a USD limit per UTC day or month over every
+ * call (no label) or the calls whose metadata carries one label value. `*`
+ * caps each value on its own.
+ */
+export interface BudgetSetRequest {
+  label?: '' | 'unit' | 'unit_version' | 'prompt_version' | 'run_id'
+  value?: string
+  period: 'day' | 'month'
+  limit_usd: number
+}
+
+export interface Budget {
+  id: string
+  label: string
+  value: string
+  period: 'day' | 'month'
+  limit_micros: number
+  limit_usd: number
+  /** This period's spend under the cap; 0 on a cap on each value (`*`). */
+  spent_micros: number
+  spent_usd: number
+  resets_at: string
+  updated_at?: string
+}
+
+/** A model role as it resolves for this install. */
+export interface RoleView {
+  name: string
+  /** Left out when the role is set nowhere and runs on the default model. */
+  model?: string
+  fallbacks: string[]
+  /** Where the mapping comes from. */
+  level?: 'install' | 'workspace' | 'account' | 'platform'
+  /** One of the roles Omazy publishes; a published role set nowhere runs on the default model. */
+  published: boolean
+  purpose?: string
+}
+
+/** GET /ai/roles. */
+export interface RoleList {
+  /** The model a role set nowhere runs on. */
+  default: string
+  roles: RoleView[]
+}
+
+/** PUT /ai/roles/{name}. */
+export interface RoleSetRequest {
+  model: string
+  /** Up to three, tried in order. */
+  fallbacks?: string[]
+  /** `install` (the default): this product only. `workspace`: every install of the workspace. */
+  level?: 'install' | 'workspace'
+}
+
+export interface RoleDeleted {
+  name: string
+  level: string
+  deleted: true
+}
+
+/** GET /ai/models. */
+export interface ModelList {
+  /** The model a completion runs on when it names none. */
+  default: string
+  models: ModelInfo[]
 }
 
 /**
@@ -175,6 +347,8 @@ export interface KnowledgePassage {
 export interface AgentTurnRequest {
   app?: string
   message: string
+  /** Labels for every model call of the turn, its tool loop included. */
+  metadata?: Metadata
   /** The session_id an earlier turn returned. */
   session_id?: string
   /** Earlier turns, oldest first. The caller keeps the conversation. */
@@ -212,6 +386,28 @@ export interface Whoami {
   token_expires_at?: string
   /** The plan the workspace is on and what it allows. Absent when it cannot be read. */
   plan?: Plan
+}
+
+/** One route of the Core route contract. */
+export interface CoreContractRoute {
+  method: string
+  path: string
+  /** The scope the route needs; empty for none. */
+  scope: string
+  /** The SDK method name. */
+  sdk: string
+  mcp_tool?: string
+  idempotency_key?: boolean
+  websocket?: boolean
+  /** The route needs no token. */
+  public?: boolean
+}
+
+/** The route contract the live platform was built with (`contracts/core-api.routes.json`). */
+export interface CoreRouteContract {
+  base?: string
+  auth?: string
+  routes: CoreContractRoute[]
 }
 
 export interface Plan {
@@ -580,7 +776,7 @@ export interface UsageDay extends UsageTotals {
 }
 
 /** One workspace's usage over a range of UTC days, empty days included. */
-export interface UsageReport {
+export interface UsageReport extends UsageGroups {
   workspace_id: string
   from: string
   to: string
@@ -594,8 +790,44 @@ export interface UsageRange {
   to?: string
 }
 
+/**
+ * Split the ledger by a label: `unit`, `unit_version`, `prompt_version`,
+ * `run_id`, `model`, `model_role`, or `tag.<key>` for a key of your own.
+ * `unit` and `run_id` narrow the groups.
+ */
+export interface UsageGrouping {
+  group_by?: 'unit' | 'unit_version' | 'prompt_version' | 'run_id' | 'model' | 'model_role' | `tag.${string}`
+  unit?: string
+  run_id?: string
+}
+
+/** One value of the label and the ledger's numbers under it; '' is the calls without it. */
+export interface UsageGroup {
+  value: string
+  model_calls: number
+  cache_hits: number
+  errors: number
+  input_tokens: number
+  output_tokens: number
+  cached_input_tokens: number
+  speech_sessions: number
+  speech_seconds: number
+  cost_micros: number
+  cost_usd: number
+  estimated_cost_micros: number
+  unpriced_calls: number
+}
+
+/** With `group_by`: the costliest 100 values over the range. */
+export interface UsageGroups {
+  group_by?: string
+  unit?: string
+  run_id?: string
+  groups?: UsageGroup[]
+}
+
 /** A range of days and a page of the account's workspaces. */
-export interface AccountUsageQuery extends UsageRange {
+export interface AccountUsageQuery extends UsageRange, UsageGrouping {
   status?: 'active' | 'suspended' | 'closed'
   external_id?: string
   cursor?: string
@@ -610,7 +842,7 @@ export interface WorkspaceUsage {
 }
 
 /** GET /enterprise/usage: a page of workspaces, and the account's totals over all of them. */
-export interface AccountUsage {
+export interface AccountUsage extends UsageGroups {
   from: string
   to: string
   totals: UsageTotals

@@ -1,13 +1,26 @@
 package omazy
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Usage is the token count of one model call.
 type Usage struct {
 	InputTokens       int `json:"input_tokens"`
 	OutputTokens      int `json:"output_tokens"`
 	CachedInputTokens int `json:"cached_input_tokens"`
+	// CostMicros is what the call cost in millionths of a US dollar, from the
+	// cost ledger's rate card; 0 for a reply from the response cache. Set on
+	// AI.Complete, nil where a route does not price the call.
+	CostMicros *int64 `json:"cost_micros,omitempty"`
 }
+
+// Metadata labels a call in the cost ledger: "unit", "unit_version",
+// "prompt_version", "run_id" (at most 128 bytes each) and up to 8 keys of
+// your own (lower case, at most 40 characters, values at most 200 bytes).
+// Usage.Query groups spend by them.
+type Metadata map[string]string
 
 // ToolCall is a tool the model asked the caller to run.
 type ToolCall struct {
@@ -29,6 +42,56 @@ type Message struct {
 	Content     string       `json:"content"`
 	ToolCalls   []ToolCall   `json:"tool_calls,omitempty"`
 	ToolResults []ToolResult `json:"tool_results,omitempty"`
+	// Images are for the model to read, on a user turn. The model must read
+	// images (Vision in Models).
+	Images []Image `json:"images,omitempty"`
+}
+
+// Image is a public https URL the provider fetches, or the bytes as standard
+// base64 (no data: prefix) with their media type: image/png, image/jpeg,
+// image/gif or image/webp. At most 8 on a message, 16 on a call, 5 MB each.
+type Image struct {
+	URL       string `json:"url,omitempty"`
+	Data      string `json:"data,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+}
+
+// ResponseFormat asks for a JSON reply. Type is "json_object" or
+// "json_schema" with JSONSchema set.
+type ResponseFormat struct {
+	Type       string      `json:"type"`
+	JSONSchema *JSONSchema `json:"json_schema,omitempty"`
+}
+
+// JSONSchema holds a reply to Schema. With Strict every object in the schema
+// must be closed (additionalProperties false) and require every property.
+type JSONSchema struct {
+	Name   string          `json:"name,omitempty"`
+	Schema json.RawMessage `json:"schema"`
+	Strict bool            `json:"strict,omitempty"`
+}
+
+// ToolChoice is "auto", "any", "none", or ForceTool("name").
+type ToolChoice struct {
+	mode, name string
+}
+
+// ToolChoiceAuto and the others are the plain choices.
+var (
+	ToolChoiceAuto = &ToolChoice{mode: "auto"}
+	ToolChoiceAny  = &ToolChoice{mode: "any"}
+	ToolChoiceNone = &ToolChoice{mode: "none"}
+)
+
+// ForceTool makes the model call the named tool, which must be in Tools.
+func ForceTool(name string) *ToolChoice { return &ToolChoice{mode: "tool", name: name} }
+
+// MarshalJSON writes the string, or {"type":"tool","name":...}.
+func (t ToolChoice) MarshalJSON() ([]byte, error) {
+	if t.mode == "tool" {
+		return json.Marshal(map[string]string{"type": "tool", "name": t.name})
+	}
+	return json.Marshal(t.mode)
 }
 
 // ToolDefinition describes a tool the model may ask for.
@@ -45,8 +108,14 @@ type CompleteRequest struct {
 	System   string           `json:"system,omitempty"`
 	Messages []Message        `json:"messages"`
 	Tools    []ToolDefinition `json:"tools,omitempty"`
-	// ToolChoice is "auto", "any" or "none".
-	ToolChoice string `json:"tool_choice,omitempty"`
+	// ToolChoice is ToolChoiceAuto, ToolChoiceAny, ToolChoiceNone or
+	// ForceTool(name). Nil leaves it out.
+	ToolChoice *ToolChoice `json:"tool_choice,omitempty"`
+	// Metadata labels every model call of the request in the cost ledger.
+	Metadata Metadata `json:"metadata,omitempty"`
+	// ResponseFormat asks for a JSON reply. The result's Text is the JSON and
+	// Output the same JSON. A model that cannot is a 422 MODEL_UNSUPPORTED.
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
 	// Model is a model id with its provider, such as openai/gpt-4o-mini.
 	Model       string   `json:"model,omitempty"`
 	Profile     string   `json:"profile,omitempty"`
@@ -59,6 +128,24 @@ type CompleteRequest struct {
 	CacheTTL *int `json:"cache_ttl,omitempty"`
 }
 
+// NoCache is a CacheTTL that never answers from the gateway's cache. Send it
+// on any request that carries live data.
+//
+//	req.CacheTTL = omazy.NoCache()
+func NoCache() *int {
+	n := 0
+	return &n
+}
+
+// CacheFor is a CacheTTL that lets a stored reply be served again for up to d,
+// in whole seconds. The API takes 60 s to 30 days and refuses anything else.
+//
+//	req.CacheTTL = omazy.CacheFor(5 * time.Minute)
+func CacheFor(d time.Duration) *int {
+	n := int(d / time.Second)
+	return &n
+}
+
 // CompleteResult is the model's answer.
 type CompleteResult struct {
 	Text       string     `json:"text"`
@@ -69,6 +156,12 @@ type CompleteResult struct {
 	// CacheHit is true when the reply came from the gateway's response cache:
 	// no model call, no cost, no AI turn.
 	CacheHit bool `json:"cache_hit,omitempty"`
+	// Output is the reply as JSON, checked against the schema, when the
+	// request set ResponseFormat. Unmarshal it into your own type.
+	Output json.RawMessage `json:"output,omitempty"`
+	// Role is the model role the request named (Model "role:<name>"); Model
+	// is then the model that answered.
+	Role string `json:"role,omitempty"`
 }
 
 // SearchOptions narrows a knowledge search. The zero value is fine.
@@ -224,8 +317,10 @@ type HistoryTurn struct {
 // AgentTurnRequest is one turn of the workspace's own agent. The caller keeps
 // the conversation: pass earlier turns in History, oldest first.
 type AgentTurnRequest struct {
-	App       string        `json:"app,omitempty"`
-	Message   string        `json:"message"`
+	App     string `json:"app,omitempty"`
+	Message string `json:"message"`
+	// Metadata labels every model call of the turn, its tool loop included.
+	Metadata  Metadata      `json:"metadata,omitempty"`
 	SessionID string        `json:"session_id,omitempty"`
 	History   []HistoryTurn `json:"history,omitempty"`
 	Language  string        `json:"language,omitempty"`
@@ -349,4 +444,26 @@ type CredentialBinding struct {
 	Token     string         `json:"token"`
 	ExpiresAt string         `json:"expires_at"`
 	Subject   map[string]any `json:"subject"`
+}
+
+// RouteContract is the Core route contract (contracts/core-api.routes.json).
+type RouteContract struct {
+	Base   string          `json:"base,omitempty"`
+	Auth   string          `json:"auth,omitempty"`
+	Routes []ContractRoute `json:"routes"`
+}
+
+// ContractRoute is one route of the contract.
+type ContractRoute struct {
+	Method string `json:"method"`
+	Path   string `json:"path"`
+	// Scope is the scope the route needs; empty for none.
+	Scope string `json:"scope"`
+	// SDK is the SDK method name.
+	SDK            string `json:"sdk"`
+	MCPTool        string `json:"mcp_tool,omitempty"`
+	IdempotencyKey bool   `json:"idempotency_key,omitempty"`
+	WebSocket      bool   `json:"websocket,omitempty"`
+	// Public marks a route that needs no token.
+	Public bool `json:"public,omitempty"`
 }

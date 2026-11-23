@@ -131,7 +131,13 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 		ok(`{"passages":[]}`)(w, r)
 	})
 	c.Whoami(ctx)
+	c.Contract(ctx)
 	c.AI.Complete(ctx, CompleteRequest{Messages: hi})
+	c.AI.Embed(ctx, EmbedRequest{Input: []string{"hi"}})
+	c.AI.Models(ctx, "")
+	c.AI.Roles(ctx, "")
+	c.AI.SetRole(ctx, "c1", RoleSet{Model: "openai/gpt-4o"})
+	c.AI.DeleteRole(ctx, "c1", "")
 	c.Knowledge.Search(ctx, "q", SearchOptions{})
 	c.Knowledge.ListDocuments(ctx, ListOptions{})
 	c.Knowledge.CreateDocument(ctx, DocumentInput{Title: "t", Content: "c"})
@@ -165,6 +171,9 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 	c.Sessions.BindCredential(ctx, "s1", "erp", CredentialBinding{Token: "t", ExpiresAt: "2027-01-01T00:00:00Z"})
 	c.Sessions.UnbindCredential(ctx, "s1", "erp")
 	c.Usage.Get(ctx, "", "")
+	c.Budgets.List(ctx)
+	c.Budgets.Set(ctx, BudgetSet{Period: "day", LimitUSD: 5})
+	c.Budgets.Delete(ctx, "c1")
 	c.MCP.ListTools(ctx)
 
 	used := map[string]bool{}
@@ -181,7 +190,7 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 		} else if strings.HasPrefix(name, "conv") {
 			id = "s1"
 		}
-		p := strings.NewReplacer("{ref}", "r1", "{sid}", "s1", "{server}", "erp", "{id}", id).Replace(r.path)
+		p := strings.NewReplacer("{ref}", "r1", "{sid}", "s1", "{server}", "erp", "{name}", "c1", "{id}", id).Replace(r.path)
 		if !used[r.method+" "+p] {
 			t.Errorf("%s (%s %s) was never called", name, r.method, p)
 		}
@@ -190,7 +199,7 @@ func TestEveryRouteIsReachableThroughAClientMethod(t *testing.T) {
 
 func TestNothingThatChangesTheWorldIsRetried(t *testing.T) {
 	for _, name := range []string{"voice.calls.place", "conversations.post_message", "channels.linkedin_publish", "agent.turn", "customers.update", "voice.jobs.create", "mcp",
-		"knowledge.documents.create", "knowledge.documents.update", "knowledge.documents.delete", "knowledge.import_file", "knowledge.sources.create", "knowledge.sources.crawl"} {
+		"knowledge.documents.create", "knowledge.import_file", "knowledge.sources.create", "knowledge.sources.crawl"} {
 		if retryable[name] {
 			t.Errorf("%s must not be retried", name)
 		}
@@ -427,11 +436,11 @@ func TestAnExportSendsSinceEvenWhenItIsZero(t *testing.T) {
 
 func TestAKnowledgeWriteIsNeverSentTwiceAndAReadIs(t *testing.T) {
 	f, c := newFake(t, fail(503, "UPSTREAM_UNAVAILABLE", "try later"))
-	if err := c.Knowledge.DeleteDocument(ctx, "01A", ""); err == nil {
-		t.Fatal("a refused delete returned no error")
+	if err := c.Knowledge.CrawlSource(ctx, "s1", ""); err == nil {
+		t.Fatal("a refused crawl returned no error")
 	}
 	if len(f.seen) != 1 {
-		t.Fatalf("the delete was sent %d times", len(f.seen))
+		t.Fatalf("the crawl was sent %d times", len(f.seen))
 	}
 	f, c = newFake(t, fail(429, "RATE_LIMITED", "slow down", "Retry-After", "1"), ok(`{"documents":[],"next_cursor":"","version":3}`))
 	page, err := c.Knowledge.ListDocuments(ctx, ListOptions{Limit: 10})
@@ -537,5 +546,74 @@ func TestAVoiceJobNamesItsAppInTheQuery(t *testing.T) {
 	}
 	if !strings.Contains(f.seen[0].path, "app=nordwell") || strings.Contains(f.seen[0].body, "app") {
 		t.Errorf("path=%s body=%s", f.seen[0].path, f.seen[0].body)
+	}
+}
+
+func TestADocumentChangeAndDeleteAreSentAgain(t *testing.T) {
+	f, c := newFake(t, fail(503, "UPSTREAM_UNAVAILABLE", "busy"), ok(`{"id":"01A","is_active":false}`))
+	off := false
+	if doc, err := c.Knowledge.UpdateDocument(ctx, "01A", DocumentPatch{IsActive: &off}); err != nil || doc.ID != "01A" {
+		t.Fatalf("doc = %+v, err = %v", doc, err)
+	}
+	if len(f.seen) != 2 {
+		t.Fatalf("the change was sent %d times", len(f.seen))
+	}
+	f, c = newFake(t, fail(502, "BAD_GATEWAY", "lost"), fail(404, "NOT_FOUND", "document not found"))
+	var apiErr *Error
+	if err := c.Knowledge.DeleteDocument(ctx, "01A", ""); !errors.As(err, &apiErr) || apiErr.Code != "NOT_FOUND" {
+		t.Fatalf("err = %v", err)
+	}
+	if len(f.seen) != 2 || f.seen[1].method != "DELETE" {
+		t.Fatalf("the delete was sent %d times", len(f.seen))
+	}
+}
+
+func TestWithResponseInfoKeepsEachCallsOwnHeaders(t *testing.T) {
+	// The slow call is answered after the fast one, so Last ends on it while
+	// each call's own info holds the answer to that call.
+	fastDone := make(chan struct{})
+	slowArrived := make(chan struct{})
+	_, c := newFake(t, func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:]
+		if name == "slow" {
+			close(slowArrived)
+			<-fastDone
+		}
+		ok(`{"id":"`+name+`"}`, "X-Request-Id", "req_"+name, "X-RateLimit-Limit", "600")(w, r)
+	})
+	var slow, fast ResponseInfo
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if _, err := c.Knowledge.GetDocument(WithResponseInfo(ctx, &slow), "slow", ""); err != nil {
+			t.Error(err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		<-slowArrived
+		if _, err := c.Knowledge.GetDocument(WithResponseInfo(ctx, &fast), "fast", ""); err != nil {
+			t.Error(err)
+		}
+		close(fastDone)
+	}()
+	wg.Wait()
+	if slow.RequestID != "req_slow" || fast.RequestID != "req_fast" || fast.RateLimit != 600 {
+		t.Fatalf("slow = %+v, fast = %+v", slow, fast)
+	}
+	if c.Last().RequestID != "req_slow" {
+		t.Fatalf("last = %+v", c.Last())
+	}
+}
+
+func TestWithResponseInfoIsWrittenOnARefusal(t *testing.T) {
+	_, c := newFake(t, fail(403, "FORBIDDEN", "no", "X-Request-Id", "req_r"))
+	var info ResponseInfo
+	if _, err := c.Whoami(WithResponseInfo(ctx, &info)); err == nil {
+		t.Fatal("no error")
+	}
+	if info.RequestID != "req_r" {
+		t.Fatalf("info = %+v", info)
 	}
 }

@@ -78,16 +78,21 @@ func TestUpdateMCPServerSendsOnlyWhatChanges(t *testing.T) {
 	}
 }
 
-func TestAChangeToAnMCPServerIsSentAgainAndARemovalIsNot(t *testing.T) {
+func TestAChangeToAnMCPServerAndARemovalAreSentAgain(t *testing.T) {
 	on := true
 	f, c := newFake(t, fail(503, "UPSTREAM_UNAVAILABLE", "try again"), ok(serverJSON))
 	if _, err := c.Agent.UpdateMCPServer(ctx, "s1", MCPServerUpdate{IsActive: &on}); err != nil || len(f.seen) != 2 {
 		t.Fatalf("a change: %v, sent %d times", err, len(f.seen))
 	}
-	// A second delete would answer 404 for a server the first one removed.
 	f, c = newFake(t, fail(503, "UPSTREAM_UNAVAILABLE", "try again"), ok(`{"id":"s1","deleted":true}`))
-	if err := c.Agent.DeleteMCPServer(ctx, "s1", ""); err == nil || len(f.seen) != 1 {
+	if err := c.Agent.DeleteMCPServer(ctx, "s1", ""); err != nil || len(f.seen) != 2 {
 		t.Fatalf("a removal: %v, sent %d times", err, len(f.seen))
+	}
+	// The first removal went through but its answer was lost: the retry is told NOT_FOUND.
+	f, c = newFake(t, fail(502, "BAD_GATEWAY", "lost"), fail(404, "NOT_FOUND", "MCP server not found"))
+	var apiErr *Error
+	if err := c.Agent.DeleteMCPServer(ctx, "s1", ""); !errors.As(err, &apiErr) || apiErr.Code != "NOT_FOUND" || len(f.seen) != 2 {
+		t.Fatalf("a lost removal: %v, sent %d times", err, len(f.seen))
 	}
 }
 

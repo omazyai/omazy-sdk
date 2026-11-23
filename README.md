@@ -4,11 +4,13 @@ Clients for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/): mod
 
 | SDK | Folder | Runs on | Dependencies |
 |---|---|---|---|
-| TypeScript | [`typescript/`](typescript/) | Node 18+, Bun, Deno, Cloudflare Workers | none |
+| TypeScript | [`typescript/`](typescript/) | Node 20+, Bun, Deno, Cloudflare Workers | none |
 | Python | [`python/`](python/) | Python 3.9+ | none (standard library) |
 | Go | [`go/`](go/) | Go 1.22+ | none (standard library) |
 
 The three clients cover the same routes under the same names, over HTTP and over the Core API's MCP server.
+
+To start a new AI product on the TypeScript kits, [`create-omazy-app/`](create-omazy-app/) writes a Cloudflare Worker with capabilities, the guard and an MCP door, pinned to the SDK of the same version: `npm create omazy-app@latest my-product`.
 
 ## Install
 
@@ -27,19 +29,19 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.4.0/omazyai-sdk-0.4.0.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.0/omazyai-sdk-0.5.0.tgz
 ```
 
 **Python.**
 
 ```sh
-pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.4.0/omazy-0.4.0-py3-none-any.whl
+pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.0/omazy-0.5.0-py3-none-any.whl
 ```
 
 **Go.**
 
 ```sh
-go get github.com/omazyai/omazy-sdk/go@v0.4.0
+go get github.com/omazyai/omazy-sdk/go@v0.5.0
 ```
 
 ## Your account and your token
@@ -110,6 +112,8 @@ Each folder's README lists every method and the scope it needs.
 - **Signatures.** Verify a request the platform sent to your server (`X-Omazy-Signature`). All three test against the same vector.
 
 The TypeScript package also has what your own Worker needs (`@omazyai/sdk/server`): the flow and context request shapes, block builders and an MCP tool server.
+
+`@omazyai/sdk/capabilities` (experimental, TypeScript only) defines each action your product offers once and generates its MCP tools, model tools, forms and tools changelog from that one definition.
 
 ## Plans and limits
 

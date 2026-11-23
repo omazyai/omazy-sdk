@@ -93,16 +93,23 @@ class AgentMcpServersTest(unittest.TestCase):
         # An empty credential removes the stored one, an empty list allows every tool.
         self.assertEqual(json.loads(seen["body"]), {"credentials": "", "allowed_tools": [], "is_active": False})
 
-    def test_a_change_is_sent_again_and_a_removal_is_not(self):
+    def test_a_change_and_a_removal_are_sent_again(self):
         self.api.answers = [fail(503, "UPSTREAM_UNAVAILABLE", "try again"), ok(SERVER)]
         self.client().agent.mcp_servers.update("s1", is_active=True)
         self.assertEqual(len(self.api.seen), 2)
 
         self.api.seen.clear()
         self.api.answers = [fail(503, "UPSTREAM_UNAVAILABLE", "try again"), ok({"id": "s1", "deleted": True})]
-        with self.assertRaises(OmazyError):
+        self.assertTrue(self.client().agent.mcp_servers.delete("s1")["deleted"])
+        self.assertEqual([s["method"] for s in self.api.seen], ["DELETE", "DELETE"])
+
+        # The first removal went through but its answer was lost: the retry is told NOT_FOUND.
+        self.api.seen.clear()
+        self.api.answers = [fail(502, "BAD_GATEWAY", "lost"), fail(404, "NOT_FOUND", "MCP server not found")]
+        with self.assertRaises(OmazyError) as cm:
             self.client().agent.mcp_servers.delete("s1")
-        self.assertEqual(len(self.api.seen), 1)
+        self.assertEqual(cm.exception.code, "NOT_FOUND")
+        self.assertEqual(len(self.api.seen), 2)
 
     def test_a_name_the_app_already_uses_is_a_conflict(self):
         self.api.answers = [fail(409, "CONFLICT", "this app already has an MCP server named front-desk")]

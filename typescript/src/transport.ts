@@ -39,6 +39,24 @@ export interface Outgoing {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * One signal that aborts when either does. `AbortSignal.any` arrived in Node
+ * 20.3; on an older runtime a controller does the same job.
+ */
+export function anySignal(a: AbortSignal, b: AbortSignal): AbortSignal {
+  const any = (AbortSignal as { any?: (signals: AbortSignal[]) => AbortSignal }).any
+  if (typeof any === 'function') return any.call(AbortSignal, [a, b])
+  const ctl = new AbortController()
+  for (const s of [a, b]) {
+    if (s.aborted) {
+      ctl.abort(s.reason)
+      break
+    }
+    s.addEventListener('abort', () => ctl.abort(s.reason), { once: true, signal: ctl.signal })
+  }
+  return ctl.signal
+}
+
 export const backoff = (attempt: number) => Math.min(8000, 500 * 2 ** attempt) * (0.5 + Math.random() / 2)
 
 /** Sends a request with retries. Resolves with a 2xx response; throws OmazyError otherwise. */
@@ -58,7 +76,7 @@ export async function request(t: Transport, out: Outgoing): Promise<Response> {
 
   for (let attempt = 0; ; attempt++) {
     const timeout = AbortSignal.timeout(t.timeoutMs)
-    const signal = out.signal ? AbortSignal.any([out.signal, timeout]) : timeout
+    const signal = out.signal ? anySignal(out.signal, timeout) : timeout
     let res: Response
     try {
       res = await t.fetcher(out.url, { method: out.method, headers, body, signal })

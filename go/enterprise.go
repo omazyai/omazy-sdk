@@ -221,7 +221,8 @@ func NewEnterprise(token string, opts ...Option) *EnterpriseClient {
 	return e
 }
 
-// Last returns the headers of the most recent response.
+// Last returns the headers of the most recent response of this client,
+// whichever call it answered. WithResponseInfo gives the headers of one call.
 func (e *EnterpriseClient) Last() ResponseInfo { return e.c.Last() }
 
 // Core returns a Core API client for one customer, from that customer's
@@ -251,7 +252,7 @@ func (e *EnterpriseClient) json(ctx context.Context, name string, in call, out a
 		Meta json.RawMessage `json:"meta"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&env); err != nil {
-		return &Error{Status: res.StatusCode, Code: "BAD_RESPONSE", Message: "the response was not JSON: " + err.Error(), RequestID: e.Last().RequestID}
+		return &Error{Status: res.StatusCode, Code: "BAD_RESPONSE", Message: "the response was not JSON: " + err.Error(), RequestID: res.Header.Get("X-Request-Id")}
 	}
 	if meta != nil && len(env.Meta) > 0 {
 		if err := json.Unmarshal(env.Meta, meta); err != nil {
@@ -306,6 +307,9 @@ type AccountUsageQuery struct {
 	ExternalID string
 	Cursor     string
 	Limit      int
+	// GroupBy, Unit and RunID split the account's ledger by a label, every
+	// workspace counted, as UsageQuery does for one.
+	GroupBy, Unit, RunID string
 }
 
 // WorkspaceUsage is one managed workspace's usage.
@@ -328,6 +332,8 @@ type AccountUsage struct {
 	To         string           `json:"to"`
 	Totals     UsageTotals      `json:"totals"`
 	Workspaces []WorkspaceUsage `json:"workspaces"`
+	GroupBy    string           `json:"group_by,omitempty"`
+	Groups     []UsageGroup     `json:"groups,omitempty"`
 	// NextCursor is the Cursor of the next page, empty on the last.
 	NextCursor string `json:"-"`
 }
@@ -336,7 +342,8 @@ type AccountUsage struct {
 // workspaces, with the account's totals over every workspace. Empty From and
 // To give the last 30 days; a range covers at most 90. Needs usage:read.
 func (e *EnterpriseClient) Usage(ctx context.Context, q AccountUsageQuery) (*AccountUsage, error) {
-	query := map[string]string{"from": q.From, "to": q.To, "status": q.Status, "external_id": q.ExternalID, "cursor": q.Cursor}
+	query := map[string]string{"from": q.From, "to": q.To, "status": q.Status, "external_id": q.ExternalID, "cursor": q.Cursor,
+		"group_by": q.GroupBy, "unit": q.Unit, "run_id": q.RunID}
 	if q.Limit > 0 {
 		query["limit"] = strconv.Itoa(q.Limit)
 	}

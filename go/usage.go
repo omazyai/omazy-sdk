@@ -48,6 +48,11 @@ type UsageReport struct {
 	To          string      `json:"to"`
 	Totals      UsageTotals `json:"totals"`
 	Days        []UsageDay  `json:"days"`
+	// GroupBy, Unit, RunID and Groups are set when the query named GroupBy.
+	GroupBy string       `json:"group_by,omitempty"`
+	Unit    string       `json:"unit,omitempty"`
+	RunID   string       `json:"run_id,omitempty"`
+	Groups  []UsageGroup `json:"groups,omitempty"`
 }
 
 // UsageService reads what the workspace used and what it cost.
@@ -56,6 +61,32 @@ type UsageService struct{ c *Client }
 // Get returns the workspace's usage per UTC day from one YYYY-MM-DD to
 // another, both included. Empty from and to give the last 30 days; a range
 // covers at most 90. Needs usage:read.
+// UsageQuery is a range and, optionally, a label to split the ledger by:
+// GroupBy is "unit", "unit_version", "prompt_version", "run_id", "model",
+// "model_role" or "tag.<key>"; Unit and RunID narrow the groups.
+type UsageQuery struct {
+	From, To    string
+	GroupBy     string
+	Unit, RunID string
+}
+
+// UsageGroup is one value of the label and the ledger's numbers under it.
+// An empty Value holds the calls that carried no such label. The plan's
+// counters carry no labels and are zero here.
+type UsageGroup struct {
+	Value string `json:"value"`
+	UsageTotals
+}
+
+// Query is Get with a label to split by. The report's Groups are the
+// costliest 100 values over the range. Needs usage:read.
+func (s *UsageService) Query(ctx context.Context, q UsageQuery) (*UsageReport, error) {
+	var out UsageReport
+	return &out, s.c.json(ctx, "usage.get", call{query: map[string]string{
+		"from": q.From, "to": q.To, "group_by": q.GroupBy, "unit": q.Unit, "run_id": q.RunID,
+	}}, &out)
+}
+
 func (s *UsageService) Get(ctx context.Context, from, to string) (*UsageReport, error) {
 	var out UsageReport
 	return &out, s.c.json(ctx, "usage.get", call{query: map[string]string{"from": from, "to": to}}, &out)

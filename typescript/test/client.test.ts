@@ -14,6 +14,7 @@ import {
   type TranscriptionEvent,
 } from '../src/index'
 import { READ, readSigned, serveMcp, sign, verifySignature, type Registry } from '../src/server'
+import { anySignal } from '../src/transport'
 
 // hmac-sha256('s3cret', '{"a":1}') in hex, computed with openssl.
 const SIG_VECTOR = '5910e62016ef5034272c926c27071992a465c2335cecf41851bda071577f4f6d'
@@ -72,7 +73,13 @@ describe('contract', () => {
     }) as typeof fetch
     const o = client(fetcher)
     await o.whoami()
+    await o.contract()
     await o.ai.complete({ messages: [{ role: 'user', content: 'hi' }] })
+    await o.ai.embed('hi')
+    await o.ai.models()
+    await o.ai.roles.list()
+    await o.ai.roles.set('c1', { model: 'openai/gpt-4o' })
+    await o.ai.roles.delete('c1')
     await o.knowledge.search('q')
     await o.knowledge.documents.list()
     await o.knowledge.documents.create({ title: 't', content: 'c' })
@@ -105,19 +112,22 @@ describe('contract', () => {
     await o.sessions.bindCredential('s1', 'erp', { token: 't', expires_at: '2027-01-01T00:00:00Z', subject: {} })
     await o.sessions.unbindCredential('s1', 'erp')
     await o.usage.get()
+    await o.budgets.list()
+    await o.budgets.set({ period: 'day', limit_usd: 5 })
+    await o.budgets.delete('c1')
     await o.mcp.listTools()
 
     const used = new Set(seen.map((s) => `${s.method} ${new URL(s.url).pathname.replace('/core', '')}`))
     for (const [name, [method, path]] of Object.entries(ROUTES)) {
       // A WebSocket route is opened by its own test below, on a real socket.
       if (WEBSOCKET.has(name as RouteName)) continue
-      const filled = path.replace('{ref}', 'r1').replace('{id}', name.startsWith('voice.jobs') ? 'j1' : name.startsWith('conv') ? 's1' : 'c1').replace('{sid}', 's1').replace('{server}', 'erp')
+      const filled = path.replace('{ref}', 'r1').replace('{id}', name.startsWith('voice.jobs') ? 'j1' : name.startsWith('conv') ? 's1' : 'c1').replace('{sid}', 's1').replace('{server}', 'erp').replace('{name}', 'c1')
       expect(used.has(`${method} ${filled}`), `${name} (${method} ${filled}) was never called`).toBe(true)
     }
   })
 
   test('nothing that changes the world is retried', () => {
-    for (const name of ['voice.calls.place', 'conversations.post_message', 'channels.linkedin_publish', 'agent.turn', 'customers.update', 'voice.jobs.create', 'mcp', 'knowledge.documents.create', 'knowledge.documents.update', 'knowledge.documents.delete', 'knowledge.import_file', 'knowledge.sources.create', 'knowledge.sources.crawl'] as RouteName[]) {
+    for (const name of ['voice.calls.place', 'conversations.post_message', 'channels.linkedin_publish', 'agent.turn', 'customers.update', 'voice.jobs.create', 'mcp', 'knowledge.documents.create', 'knowledge.import_file', 'knowledge.sources.create', 'knowledge.sources.crawl'] as RouteName[]) {
       expect(RETRYABLE.has(name)).toBe(false)
     }
   })
@@ -150,6 +160,83 @@ describe('requests', () => {
     const o = client(fetcher)
     await o.whoami()
     expect(o.last).toEqual({ requestId: 'req_9', rateLimit: { limit: 600, remaining: 12, resetSeconds: 3 }, tokenExpiresAt: '2026-12-01T00:00:00Z', tokenIsPrevious: true, replayed: false })
+  })
+})
+
+describe('runtimes without AbortSignal.any', () => {
+  test('a caller signal and the timeout are combined by hand', async () => {
+    const real = (AbortSignal as { any?: unknown }).any
+    ;(AbortSignal as { any?: unknown }).any = undefined
+    try {
+      const caller = new AbortController()
+      const timer = new AbortController()
+      const both = anySignal(caller.signal, timer.signal)
+      expect(both.aborted).toBe(false)
+      caller.abort(new Error('stop'))
+      expect(both.aborted).toBe(true)
+      expect((both.reason as Error).message).toBe('stop')
+      expect(anySignal(AbortSignal.abort('gone'), timer.signal).reason).toBe('gone')
+
+      // A whole request still honours the caller's signal.
+      const ctl = new AbortController()
+      const fetcher = ((_: unknown, init?: RequestInit) =>
+        new Promise((_r, reject) => init?.signal?.addEventListener('abort', () => reject(init.signal!.reason)))) as typeof fetch
+      const pending = client(fetcher).ai.complete({ messages: [{ role: 'user', content: 'x' }] }, ctl.signal)
+      ctl.abort(new Error('caller gave up'))
+      expect(((await pending.catch((e) => e)) as Error).message).toBe('caller gave up')
+    } finally {
+      ;(AbortSignal as { any?: unknown }).any = real
+    }
+  })
+})
+
+describe('response details per call', () => {
+  // Each request answers after its own delay with its own request id, so the
+  // second call's response lands before the first's.
+  const racing = (() =>
+    (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const { content } = JSON.parse(String(init?.body)).messages[0]
+      await new Promise((r) => setTimeout(r, content === 'slow' ? 30 : 1))
+      return ok({ text: content }, { 'x-request-id': `req_${content}`, 'x-ratelimit-limit': '600', 'x-ratelimit-remaining': content === 'slow' ? '9' : '8', 'x-ratelimit-reset': '1' })
+    }) as typeof fetch)
+
+  test('withResponse gives each call its own headers while last follows every response', async () => {
+    const o = client(racing())
+    const ask = (content: string) => o.withResponse((c) => c.ai.complete({ messages: [{ role: 'user', content }] }))
+    const [slow, fast] = await Promise.all([ask('slow'), ask('fast')])
+    expect(slow.result.text).toBe('slow')
+    expect(slow.response.requestId).toBe('req_slow')
+    expect(slow.response.rateLimit?.remaining).toBe(9)
+    expect(fast.response.requestId).toBe('req_fast')
+    // last is the client's most recent response, which is the slow one here.
+    expect(o.last.requestId).toBe('req_slow')
+  })
+
+  test('the enterprise client has it too', async () => {
+    const { fetcher } = mock(ok({ id: 'acct' }, { 'x-request-id': 'req_e1' }))
+    const a = new OmazyEnterprise({ token: 'eak_abc.def', baseUrl: 'https://api.test/api/v1/enterprise', fetch: fetcher })
+    const { response } = await a.withResponse((c) => c.account())
+    expect(response.requestId).toBe('req_e1')
+    expect(a.last.requestId).toBe('req_e1')
+  })
+
+  test('a stream error carries its own request id', async () => {
+    let o: Omazy
+    // Another call's response lands while this stream is being read.
+    const body = new ReadableStream<Uint8Array>({
+      pull(ctl) {
+        o.last = { requestId: 'someone_else', tokenIsPrevious: false, replayed: false }
+        ctl.enqueue(new TextEncoder().encode('event: error\ndata: {"code":"UPSTREAM_REJECTED","message":"no"}\n\n'))
+        ctl.close()
+      },
+    }, { highWaterMark: 0 })
+    const fetcher = (async () => new Response(body, { headers: { 'x-request-id': 'req_s1', 'content-type': 'text/event-stream' } })) as unknown as typeof fetch
+    o = client(fetcher)
+    const err = (await (async () => {
+      for await (const _ of o.ai.stream({ messages: [{ role: 'user', content: 'x' }] })) void _
+    })().catch((e) => e)) as OmazyError
+    expect(err.code).toBe('UPSTREAM_REJECTED')
+    expect(err.requestId).toBe('req_s1')
   })
 })
 
@@ -401,8 +488,18 @@ describe('knowledge documents', () => {
 
   test('a write that is refused is not sent again', async () => {
     const { fetcher, seen } = mock(fail(503, 'UPSTREAM_UNAVAILABLE', 'try later'))
-    await expect(client(fetcher).knowledge.documents.delete('01A')).rejects.toBeInstanceOf(OmazyError)
+    await expect(client(fetcher).knowledge.sources.crawl('s1')).rejects.toBeInstanceOf(OmazyError)
     expect(seen.length).toBe(1)
+  })
+
+  test('a change and a delete are sent again, as the API makes them safe to repeat', async () => {
+    let { fetcher, seen } = mock(fail(503, 'UPSTREAM_UNAVAILABLE', 'busy', { 'retry-after': '0' }), ok({ id: '01A', is_active: false }))
+    expect((await client(fetcher).knowledge.documents.update('01A', { is_active: false })).id).toBe('01A')
+    expect(seen.map((s) => s.method)).toEqual(['PATCH', 'PATCH'])
+    ;({ fetcher, seen } = mock(fail(502, 'BAD_GATEWAY', 'lost', { 'retry-after': '0' }), fail(404, 'NOT_FOUND', 'document not found')))
+    const err = (await client(fetcher).knowledge.documents.delete('01A').catch((e) => e)) as OmazyError
+    expect(err.code).toBe('NOT_FOUND')
+    expect(seen.map((s) => s.method)).toEqual(['DELETE', 'DELETE'])
   })
 
   test('a rate-limited read is sent again', async () => {
@@ -531,16 +628,20 @@ describe('the agent\'s MCP servers', () => {
     expect(seen[0]!.body).toBe('{"credentials":"","allowed_tools":[],"is_active":false}')
   })
 
-  test('a change is sent again after a gateway error; a removal is not', async () => {
+  test('a change and a removal are sent again after a gateway error', async () => {
     const changed = mock(fail(503, 'UPSTREAM_UNAVAILABLE', 'try again'), ok(server))
     await client(changed.fetcher).agent.mcpServers.update('s1', { is_active: true })
     expect(changed.seen.length).toBe(2)
 
-    // A second delete would answer 404 for a server the first one removed.
     const removed = mock(fail(503, 'UPSTREAM_UNAVAILABLE', 'try again'), ok({ id: 's1', deleted: true }))
-    const err = await client(removed.fetcher).agent.mcpServers.delete('s1').catch((e) => e)
-    expect(err).toBeInstanceOf(OmazyError)
-    expect(removed.seen.length).toBe(1)
+    expect((await client(removed.fetcher).agent.mcpServers.delete('s1')).deleted).toBe(true)
+    expect(removed.seen.map((s) => s.method)).toEqual(['DELETE', 'DELETE'])
+
+    // The first removal went through but its answer was lost: the retry is told NOT_FOUND.
+    const gone = mock(fail(502, 'BAD_GATEWAY', 'lost'), fail(404, 'NOT_FOUND', 'MCP server not found'))
+    const err = (await client(gone.fetcher).agent.mcpServers.delete('s1').catch((e) => e)) as OmazyError
+    expect(err.code).toBe('NOT_FOUND')
+    expect(gone.seen.length).toBe(2)
   })
 
   test('a name the app already uses is a conflict to branch on', async () => {
@@ -677,6 +778,18 @@ function contractPath(file = 'core-api.routes.json'): URL {
   throw new Error(`contracts/${file} not found`)
 }
 
+describe('contract', () => {
+  test('contract reads the live route contract, or the OpenAPI document', async () => {
+    const { fetcher, seen } = mock(ok({ base: '/api/v1/core', routes: [{ method: 'GET', path: '/whoami', scope: '', sdk: 'whoami' }] }))
+    const got = await client(fetcher).contract()
+    expect(got.routes[0]!.sdk).toBe('whoami')
+    expect(seen[0]!.method).toBe('GET')
+    expect(seen[0]!.url).toBe('https://api.test/core/contract')
+    await client(fetcher).contract({ format: 'openapi' })
+    expect(seen[1]!.url).toBe('https://api.test/core/contract?format=openapi')
+  })
+})
+
 describe('usage', () => {
   const day = { model_calls: 2, cache_hits: 1, errors: 0, input_tokens: 10, output_tokens: 2, cached_input_tokens: 4, speech_sessions: 0, speech_seconds: 0, cost_micros: 1500, cost_usd: 0.0015, estimated_cost_micros: 0, unpriced_calls: 0, conversations: 1, ai_turns: 2, api_calls: 3, voice_minutes: 0 }
   const report = { workspace_id: 'w1', from: '2026-11-22', to: '2026-11-22', totals: day, days: [{ date: '2026-11-22', ...day }] }
@@ -708,16 +821,25 @@ describe('account usage', () => {
 })
 
 describe('live transcription', () => {
-  type Seen = { auth: string | null; app: string | null; start?: any; audio: number[]; texts: any[] }
+  type Seen = { requests: number; auth: string | null; app: string | null; start?: any; audio: number[]; texts: any[] }
 
-  /** A WebSocket server that plays the Core API's side of the stream. */
+  /**
+   * A WebSocket server that plays the Core API's side of the stream. It binds
+   * 127.0.0.1, the address the client dials. Bun.serve binds every address by
+   * default, and macOS then lets another process bind 127.0.0.1 on the same
+   * port and take the connections to it: a session went to some other local
+   * server, which refused it ("Unauthorized") or dropped it before any
+   * request reached this one. Bound to 127.0.0.1 the port is ours alone.
+   */
   function serve(script: (ws: any, msg: any, seen: Seen) => void) {
-    const seen: Seen = { auth: null, app: null, audio: [], texts: [] }
+    const seen: Seen = { requests: 0, auth: null, app: null, audio: [], texts: [] }
     const server = Bun.serve({
+      hostname: '127.0.0.1',
       port: 0,
       fetch(req, srv) {
         const url = new URL(req.url)
         if (url.pathname !== '/core/voice/transcribe/stream') return new Response('no', { status: 404 })
+        seen.requests++
         seen.auth = req.headers.get('authorization')
         seen.app = url.searchParams.get('app')
         if (seen.auth !== 'Bearer cai_abc.def') {
@@ -767,6 +889,7 @@ describe('live transcription', () => {
       s.keepalive()
       const done = await s.end()
       expect(done).toMatchObject({ text: 'Rashed Karim', language: 'en', audio_ms: 1200 })
+      expect(srv.seen.requests).toBe(1)
       expect(srv.seen.auth).toBe('Bearer cai_abc.def')
       expect(srv.seen.app).toBe('kiosk')
       expect(srv.seen.start).toEqual({ type: 'start', language: 'bn', terms: ['Rashed Karim'], audio_format: 'pcm_s16le', sample_rate: 16000 })
@@ -802,6 +925,46 @@ describe('live transcription', () => {
     }
   })
 
+  test('commit and end give up after their timeout, and a late answer is not handed to the next commit', async () => {
+    // The order is driven by the test, not by timers: the late answer goes out
+    // only after the first commit gave up, and the second commit only after the
+    // client has read that late answer. A timer race let the second answer
+    // overtake the first under load, so the second commit got "utterance 1".
+    let commits = 0
+    let firstCommit!: (answer: () => void) => void
+    const heldBack = new Promise<() => void>((r) => (firstCommit = r))
+    const srv = serve((sock, msg) => {
+      if (msg.type === 'commit') {
+        commits++
+        const answer = JSON.stringify({ type: 'final', text: `utterance ${commits}`, language: 'en', committed: true })
+        // The first commit is answered when the test says; the second at once.
+        if (commits === 1) firstCommit(() => sock.send(answer))
+        else sock.send(answer)
+      }
+      // end is never answered.
+    })
+    try {
+      let lateRead!: () => void
+      const late = new Promise<void>((r) => (lateRead = r))
+      const o = new Omazy({ token: 'cai_abc.def', baseUrl: srv.base, webSocket: ws })
+      const s = await o.voice.transcribeStream({ onEvent: (e) => e.type === 'final' && e.text === 'utterance 1' && lateRead() })
+      const slow = (await s.commit({ timeoutMs: 40 }).catch((e) => e)) as OmazyError
+      expect(slow).toBeInstanceOf(OmazyError)
+      expect(slow.code).toBe('STREAM_ERROR')
+      expect(slow.message).toBe('no answer to commit in 0.04 s')
+      // The late answer arrives, and the client reads it, before the next commit.
+      ;(await heldBack)()
+      await late
+      expect((await s.commit()).text).toBe('utterance 2')
+      const end = (await s.end({ timeoutMs: 40 }).catch((e) => e)) as OmazyError
+      expect(end.code).toBe('STREAM_ERROR')
+      expect(end.requestId).toBe('req_1')
+      s.close()
+    } finally {
+      srv.stop()
+    }
+  })
+
   test('the default factory sends the token on the upgrade', async () => {
     const srv = serve((sock, msg) => {
       if (msg.type === 'end') sock.send(JSON.stringify({ type: 'done', text: '', language: '', audio_ms: 0 }))
@@ -810,9 +973,14 @@ describe('live transcription', () => {
       const o = new Omazy({ token: 'cai_abc.def', baseUrl: srv.base })
       const s = await o.voice.transcribeStream({ audioFormat: 'auto' })
       expect((await s.end()).audio_ms).toBe(0)
+      expect(srv.seen.requests).toBe(1)
       expect(srv.seen.auth).toBe('Bearer cai_abc.def')
       const bad = new Omazy({ token: 'cai_abc.bad', baseUrl: srv.base })
+      const before = srv.seen.requests
       expect(await bad.voice.transcribeStream().catch((e) => e)).toBeInstanceOf(OmazyError)
+      // The refusal came from the server, for the bad token.
+      expect(srv.seen.requests).toBe(before + 1)
+      expect(srv.seen.auth).toBe('Bearer cai_abc.bad')
     } finally {
       srv.stop()
     }

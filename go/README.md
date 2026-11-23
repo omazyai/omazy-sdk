@@ -5,7 +5,7 @@ Go client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/). S
 ## Install
 
 ```sh
-go get github.com/omazyai/omazy-sdk/go@v0.4.0
+go get github.com/omazyai/omazy-sdk/go@v0.5.0
 ```
 
 ```go
@@ -147,7 +147,7 @@ if errors.As(err, &e) && (e.Code == "PLAN_LIMIT_REACHED" || e.Code == "PAYMENT_R
 }
 ```
 
-`Status`, `Code`, `Message`, `RequestID` and `RetryAfter` are set from the response. After any call, `c.Last()` holds the request id, the rate limit and the token's deadline.
+`Status`, `Code`, `Message`, `RequestID` and `RetryAfter` are set from the response. `omazy.WithResponseInfo(ctx, &info)` has the call made with that context write its request id, rate limit and token deadline into `info`, which other goroutines never change. `c.Last()` holds the same for the client's most recent response, whichever call it answered, so with goroutines sharing a client it can belong to another call.
 
 ## One workspace per customer
 

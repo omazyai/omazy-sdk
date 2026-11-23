@@ -1,0 +1,3 @@
+# The templates hold the tests a new product runs with vitest; only test/ is ours.
+[test]
+root = "./test"
