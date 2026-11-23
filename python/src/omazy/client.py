@@ -17,7 +17,7 @@ from .routes import IDEMPOTENT, RETRYABLE, ROUTES
 from .stt import TranscriptionSession, open_transcription
 
 DEFAULT_BASE_URL = "https://mw.omazy.ai/api/v1/core"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 Json = Dict[str, Any]
 

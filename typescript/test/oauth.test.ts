@@ -1196,9 +1196,9 @@ describe('oauth: keys', () => {
 })
 
 describe('oauth: hardening from the review', () => {
-  test('a platform door needs checkSeat; a server without one still starts', () => {
-    expect(() => setup({ checkSeat: undefined })).toThrow('checkSeat')
-    expect(() => setup({ checkSeat: undefined, doors: { org: DOORS.org } as never, platformDoors: [] })).not.toThrow()
+  test('every door needs checkSeat, a tenant door too (round 6)', () => {
+    expect(() => setup({ checkSeat: undefined as never })).toThrow('checkSeat is required')
+    expect(() => setup({ checkSeat: undefined as never, doors: { org: DOORS.org } as never, platformDoors: [] })).toThrow('checkSeat is required')
   })
 
   test('the last-use memory of an isolate is bounded', async () => {
@@ -1304,6 +1304,7 @@ describe('oauth: re-review', () => {
         productName: 'Notes',
         signIn: { url: 'https://app.example.com/mcp-sign-in', authenticate: (c: string, st: string) => codes.redeem(c, st) },
         chooseSeat: (_p: Principal, door: string) => (door === 'admin' ? adminSeat : null),
+        checkSeat: () => true,
         clients: { admin: { knownDomains: ['claude.example'], unverified: 'allow' } },
         keys: { personal: { prefix: (d: string) => `notes_mcp_${d}_` }, service: { prefix: (d: string) => `notes_svc_${d}_`, maxTier: 'R4' } },
         onEvent: (e: unknown) => events.push(e),
@@ -1616,13 +1617,38 @@ function cimdHook(handler: (url: string, init: any) => Promise<Response | undefi
 // ---------------------------------------------------------------- final review (round 3)
 
 /**
+ * Cloudflare KV as documented: `list()` is eventually consistent, so a key
+ * written in the last minute or so may be missing from a listing. Gets and
+ * puts here are exact; only the listing lags, by `lagMs` from a key's first write.
+ */
+function laggingList(inner: ReturnType<typeof O.memoryKv>, lagMs = 60_000): ReturnType<typeof O.memoryKv> {
+  const born = new Map<string, number>()
+  return {
+    ...inner,
+    async put(k: string, v: string, o?: any) {
+      if (!born.has(k)) born.set(k, Date.now())
+      await inner.put(k, v, o)
+    },
+    async delete(k: string) {
+      born.delete(k)
+      await inner.delete(k)
+    },
+    async list(o?: any) {
+      const r = await inner.list(o)
+      return { ...r, keys: r.keys.filter((k) => Date.now() - (born.get(k.name) ?? 0) >= lagMs) }
+    },
+  }
+}
+
+/**
  * Cloudflare KV as two locations see it: one central store, and per location
  * a read cache that keeps what it read for 60 s (KV's default cacheTtl). A
  * location sees its own writes at once; another location sees them once its
  * cached copy expires. Concurrent writes: last write wins (a delete is a write).
+ * The namespace's `list()` lags about 60 s in every location (`laggingList`).
  */
 function kvLocations() {
-  const central = O.memoryKv()
+  const central = laggingList(O.memoryKv())
   const view = () => {
     const cache = new Map<string, { raw: string | null; at: number }>()
     const raw = async (key: string): Promise<string | null> => {
@@ -2705,5 +2731,351 @@ describe('oauth: round 5 L2, a client revoking its own token tombstones the gran
     expect(rev.status).toBe(401)
     expect(await store.tombstoned(grantOf(t.refresh_token))).toBeNull()
     expect(await s.oauth.resolveSeat('org', t.access_token, req())).not.toBeNull()
+  })
+})
+
+// ---------------------------------------------------------------- round 6
+
+// Proofs from the sixth review, ported. Each runs the reviewer's exploit and passes when it fails.
+
+/** A tenant-only product (no platform door), the shape the example Worker has, on a consistent store. */
+function tenantServer(kv: any, extra: Partial<Parameters<OAuthMod['authorizationServer']>[0]> = {}) {
+  resetPeople()
+  const codes = O.signInCodes(kv)
+  const events: any[] = []
+  const oauth = O.authorizationServer<'org'>({
+    issuer: ISSUER,
+    kv,
+    doors: { org: DOORS.org },
+    platformDoors: [],
+    productName: 'Notes',
+    signIn: { url: 'https://app.example.com/mcp-sign-in', authenticate: (code, state) => codes.redeem(code, state) },
+    chooseSeat: (person) => people[person.id]?.seats.org ?? null,
+    checkSeat: (g) => g.principal.kind === 'service' || people[g.principal.id]?.seats.org?.id === g.seat.id,
+    keys: { personal: { prefix: (d) => `notes_mcp_${d}_` }, service: { prefix: (d) => `notes_svc_${d}_` } },
+    clients: { org: { unverified: 'allow' } },
+    refresh: { store: O.durableObjectRefreshStore(fakeNamespace()) },
+    onEvent: (e) => events.push(e),
+    ...extra,
+  } as Parameters<OAuthMod['authorizationServer']>[0] as never)
+  return { kv, codes, oauth: oauth as any, events }
+}
+
+describe('oauth: round 6 R6-1, revocation finds what KV list() has not shown yet', () => {
+  test('a server without checkSeat does not start, at a tenant door either', () => {
+    expect(() => tenantServer(O.memoryKv(), { checkSeat: undefined as never })).toThrow('checkSeat is required at every door')
+  })
+
+  test('personLostRole revokes a grant and a key made seconds before, with checkSeat still saying yes', async () => {
+    const t0 = Date.now()
+    setSystemTime(new Date(t0))
+    // checkSeat that still says yes isolates the fix: only personLostRole can stop her here.
+    const s = tenantServer(laggingList(O.memoryKv()), { checkSeat: () => true })
+    const t = await connected(s as any)
+    const pk = await s.oauth.keys.createPersonal({ principal: people.rina!.principal, seat: people.rina!.seats.org!, name: 'k' })
+    setSystemTime(new Date(t0 + 10_000))
+    // The listing shows neither yet; the index in the store has both.
+    expect(await s.kv.list({ prefix: 'grant:rina:' }).then((r: any) => r.keys.length)).toBe(0)
+    expect(await s.oauth.personLostRole('rina')).toEqual({ grants: 1, keys: 1 })
+    expect(await s.oauth.resolveSeat('org', t.access, req())).toBeNull()
+    expect(await s.oauth.resolveSeat('org', pk.key, req())).toBeNull()
+    setSystemTime(new Date(t0 + 5 * 60_000))
+    expect((await refresh(s as any, t.clientId, t.refresh)).res.status).toBe(400)
+    setSystemTime(new Date(t0 + 20 * 86_400_000))
+    expect((await refresh(s as any, t.clientId, t.refresh)).res.status).toBe(400)
+    expect(await s.oauth.resolveSeat('org', pk.key, req())).toBeNull()
+    expect(await s.oauth.connectedApps('rina')).toEqual({ apps: [], keys: [] })
+  })
+
+  test('revokeApp and connectedApps see a grant made seconds before', async () => {
+    const t0 = Date.now()
+    setSystemTime(new Date(t0))
+    const s = tenantServer(laggingList(O.memoryKv()))
+    const t = await connected(s as any)
+    setSystemTime(new Date(t0 + 10_000))
+    expect((await s.oauth.connectedApps('rina')).apps.map((a: any) => a.grantId)).toEqual([grantOf(t.refresh)])
+    expect(await s.oauth.revokeApp('imran', grantOf(t.refresh))).toBe(false)
+    expect(await s.oauth.revokeApp('rina', grantOf(t.refresh))).toBe(true)
+    expect(await s.oauth.resolveSeat('org', t.access, req())).toBeNull()
+    expect((await refresh(s as any, t.clientId, t.refresh)).res.status).toBe(400)
+    expect((await s.oauth.connectedApps('rina')).apps).toEqual([])
+  })
+
+  test('the revocation mark refuses a grant and a key the index missed', async () => {
+    const t0 = Date.now()
+    setSystemTime(new Date(t0))
+    // A store whose index lost everything: only the mark is left to act.
+    const inner = O.durableObjectRefreshStore(fakeNamespace())
+    const store = { ...inner, indexList: async () => [] }
+    const s = tenantServer(laggingList(O.memoryKv()), { checkSeat: () => true, refresh: { store } })
+    const t = await connected(s as any)
+    const pk = await s.oauth.keys.createPersonal({ principal: people.rina!.principal, seat: people.rina!.seats.org!, name: 'k' })
+    setSystemTime(new Date(t0 + 10_000))
+    expect(await s.oauth.personLostRole('rina')).toEqual({ grants: 0, keys: 0 })
+    expect(await s.oauth.resolveSeat('org', t.access, req())).toBeNull()
+    expect(await s.oauth.resolveSeat('org', pk.key, req())).toBeNull()
+    const r = await refresh(s as any, t.clientId, t.refresh)
+    expect(r.res.status).toBe(400)
+    expect(s.events.some((e) => e.type === 'grant_revoked' && e.reason === 'person_revoked')).toBe(true)
+    expect(await inner.tombstoned(grantOf(t.refresh))).not.toBeNull()
+    // A grant made after the mark is not covered.
+    setSystemTime(new Date(t0 + 20_000))
+    const again = await connected(s as any)
+    expect(await s.oauth.resolveSeat('org', again.access, req())).not.toBeNull()
+    expect((await refresh(s as any, again.clientId, again.refresh)).res.status).toBe(200)
+  })
+
+  test('a mark at one tenant leaves another tenant alone', async () => {
+    const s = tenantServer(O.memoryKv(), { checkSeat: () => true })
+    const t = await connected(s as any)
+    await s.oauth.personLostRole('rina', { tenant: 'branch-2' })
+    expect(await s.oauth.resolveSeat('org', t.access, req())).not.toBeNull()
+    expect((await refresh(s as any, t.clientId, t.refresh)).res.status).toBe(200)
+  })
+
+  test('checkSeat runs on refresh: a seat that is gone revokes the grant', async () => {
+    const t0 = Date.now()
+    setSystemTime(new Date(t0))
+    const s = tenantServer(laggingList(O.memoryKv()))
+    const t = await connected(s as any)
+    setSystemTime(new Date(t0 + 10_000))
+    delete people.rina!.seats.org
+    expect(await s.oauth.resolveSeat('org', t.access, req())).toBeNull()
+    setSystemTime(new Date(t0 + 5 * 60_000))
+    const r = await refresh(s as any, t.clientId, t.refresh)
+    expect(r.res.status).toBe(400)
+    expect(r.body.error).toBe('invalid_grant')
+    expect(s.events.some((e) => e.type === 'grant_revoked' && e.reason === 'seat_gone')).toBe(true)
+    expect((await s.oauth.connectedApps('rina')).apps).toHaveLength(0)
+  })
+
+  test('checkSeat runs on the code exchange too', async () => {
+    const s = tenantServer(O.memoryKv())
+    const c = await client(s.oauth)
+    const a = await authorize(s as any, c.clientId)
+    delete people.rina!.seats.org
+    const t = await exchange(s as any, c.clientId, a.to.searchParams.get('code')!, a.verifier)
+    expect(t.res.status).toBe(400)
+    expect(t.body.error).toBe('invalid_grant')
+  })
+
+  test('a checkSeat that throws at refresh answers 503 and revokes nothing; the same refresh token works after', async () => {
+    let down = false
+    const s = tenantServer(O.memoryKv(), {
+      checkSeat: (g) => {
+        if (down) throw new Error('database down')
+        return people[g.principal.id]?.seats.org?.id === g.seat.id
+      },
+    })
+    const t = await connected(s as any)
+    down = true
+    const r = await refresh(s as any, t.clientId, t.refresh)
+    expect(r.res.status).toBe(503)
+    down = false
+    const ok = await refresh(s as any, t.clientId, t.refresh)
+    expect(ok.res.status).toBe(200)
+    expect(await s.oauth.resolveSeat('org', ok.body.access_token, req())).not.toBeNull()
+  })
+
+  test('on D1: the index, the person revocation and prune', async () => {
+    const t0 = Date.now()
+    setSystemTime(new Date(t0))
+    const store = (await d1Store()) as any
+    const s = tenantServer(laggingList(O.memoryKv()), { checkSeat: () => true, refresh: { store } })
+    const t = await connected(s as any)
+    const pk = await s.oauth.keys.createPersonal({ principal: people.rina!.principal, seat: people.rina!.seats.org!, name: 'k' })
+    expect((await store.indexList('person:rina')).map((e: any) => e.kind).sort()).toEqual(['grant', 'key'])
+    setSystemTime(new Date(t0 + 10_000))
+    expect(await s.oauth.personLostRole('rina', { door: 'org' })).toEqual({ grants: 1, keys: 1 })
+    expect(await store.personRevocations('rina')).toEqual([{ before: t0 + 10_000, door: 'org', tenant: null }])
+    // A later revocation for the same door and tenant keeps the later moment.
+    await store.revokePerson('rina', { before: t0, door: 'org', tenant: null }, 60)
+    expect((await store.personRevocations('rina'))[0].before).toBe(t0 + 10_000)
+    expect(await s.oauth.resolveSeat('org', t.access, req())).toBeNull()
+    expect(await s.oauth.resolveSeat('org', pk.key, req())).toBeNull()
+    expect(await store.indexList('person:rina')).toEqual([])
+    setSystemTime(new Date(t0 + 400 * 86_400_000))
+    expect(await store.prune()).toBeGreaterThan(0)
+    expect(await store.personRevocations('rina')).toEqual([])
+  })
+
+  test('the Durable Object drops expired index entries and revocations at its alarm', async () => {
+    const t0 = Date.now()
+    setSystemTime(new Date(t0))
+    const ns = fakeNamespace()
+    const store = O.durableObjectRefreshStore(ns)
+    await store.indexPut('person:rina', { kind: 'grant', id: 'g1', door: 'org', tenant: 'branch-1', until: t0 + 60_000 })
+    await store.revokePerson('rina', { before: t0, door: null, tenant: null }, 120)
+    expect(await store.indexList('person:rina')).toHaveLength(1)
+    setSystemTime(new Date(t0 + 200_000))
+    expect(await store.indexList('person:rina')).toEqual([])
+    expect(await store.personRevocations('rina')).toEqual([])
+    await ns.alarmAll()
+    const raw = await O.durableObjectRefreshStore(ns).indexList('person:rina')
+    expect(raw).toEqual([])
+  })
+
+  test('a tenant door on the KV refresh store warns at start', () => {
+    const seen: string[] = []
+    const warn = console.warn
+    console.warn = (m: string) => void seen.push(String(m))
+    try {
+      O.authorizationServer<'branch'>({
+        issuer: ISSUER,
+        kv: O.memoryKv(),
+        doors: { branch: `${ISSUER}/branch` },
+        platformDoors: [],
+        productName: 'Notes',
+        signIn: { url: 'https://app.example.com/mcp-sign-in', authenticate: () => null },
+        chooseSeat: () => null,
+        checkSeat: () => true,
+      })
+    } finally {
+      console.warn = warn
+    }
+    expect(seen.some((m) => m.includes('tenant door branch uses the KV refresh store'))).toBe(true)
+  })
+})
+
+describe('oauth: round 6 R6-2, a revoked key stays revoked in every location', () => {
+  const twoLocations = () => {
+    const kv = kvLocations()
+    const store = O.durableObjectRefreshStore(fakeNamespace())
+    const x = tenantServer(kv.x, { refresh: { store } })
+    const y = tenantServer(kv.y, { refresh: { store } })
+    return { kv, x, y, store }
+  }
+
+  test('a revoked personal key stops at once in another location', async () => {
+    const { x, y } = twoLocations()
+    const pk = await x.oauth.keys.createPersonal({ principal: people.rina!.principal, seat: people.rina!.seats.org!, name: 'leaked' })
+    expect(await y.oauth.resolveSeat('org', pk.key, req())).not.toBeNull()
+    expect(await x.oauth.keys.revoke('rina', pk.info.id)).toBe(true)
+    expect(await x.oauth.resolveSeat('org', pk.key, req())).toBeNull()
+    setSystemTime(new Date(Date.now() + 45_000))
+    expect(await y.oauth.resolveSeat('org', pk.key, req())).toBeNull()
+    expect(await y.oauth.keys.list('rina')).toEqual([])
+  })
+
+  test('transferService in a location with a stale cache refuses a revoked service key', async () => {
+    const { kv, x, y } = twoLocations()
+    const sk = await x.oauth.keys.createService({ owner: people.rina!.principal, tenant: 'branch-1', door: 'org', name: 'integration', tools: ['notes_list'] })
+    expect((await y.oauth.keys.list('rina')).map((k: any) => k.id)).toEqual([sk.info.id])
+    expect(await x.oauth.keys.revoke('rina', sk.info.id)).toBe(true)
+    setSystemTime(new Date(Date.now() + 5_000))
+    expect(await y.oauth.keys.transferService('rina', sk.info.id, people.imran!.principal)).toBe(false)
+    setSystemTime(new Date(Date.now() + 120_000))
+    expect(await kv.central.get(`omazy-oauth:key:${await sha256Hex(sk.key)}`)).toBeNull()
+    expect(await x.oauth.resolveSeat('org', sk.key, req())).toBeNull()
+    expect((await x.oauth.connectedApps('imran')).keys).toEqual([])
+  })
+
+  test('a key moved before its owner is revoked stays with the new owner', async () => {
+    const s = tenantServer(laggingList(O.memoryKv()))
+    const sk = await s.oauth.keys.createService({ owner: people.rina!.principal, tenant: 'branch-1', door: 'org', name: 'integration', tools: ['notes_list'] })
+    setSystemTime(new Date(Date.now() + 1000))
+    expect(await s.oauth.keys.transferService('rina', sk.info.id, people.imran!.principal)).toBe(true)
+    setSystemTime(new Date(Date.now() + 1000))
+    expect(await s.oauth.personLostRole('rina')).toEqual({ grants: 0, keys: 0 })
+    expect(await s.oauth.resolveSeat('org', sk.key, req())).not.toBeNull()
+    expect((await s.oauth.keys.list('imran')).map((k: any) => k.id)).toEqual([sk.info.id])
+  })
+
+  test('Keys on its own takes the store; without one the KV window stays, as documented', async () => {
+    const kv = kvLocations()
+    const store = O.durableObjectRefreshStore(fakeNamespace())
+    const opts = { personal: { prefix: () => 'notes_mcp_org_' } }
+    const seat = { id: 'seat-rina-b1', door: 'org', tenant: 'branch-1' }
+    for (const withStore of [true, false]) {
+      const x = new O.Keys<'org'>(kv.x as any, ['org'], opts, [], withStore ? store : undefined)
+      const y = new O.Keys<'org'>(kv.y as any, ['org'], opts, [], withStore ? store : undefined)
+      const pk = await x.createPersonal({ principal: { kind: 'member', id: 'rina' }, seat, name: 'k' })
+      expect(await y.resolve(pk.key, 'org')).not.toBeNull()
+      expect(await x.revoke('rina', pk.info.id)).toBe(true)
+      expect(await y.resolve(pk.key, 'org')).toEqual(withStore ? null : expect.anything())
+    }
+  })
+})
+
+describe('oauth: round 6 R6-3, every numeric option is a whole number', () => {
+  const bad = [Number.NaN, Number.POSITIVE_INFINITY, 1.5, 0, -1]
+  test('NaN, Infinity, a fraction or zero throws at start', () => {
+    for (const n of bad) {
+      expect(() => tenantServer(O.memoryKv(), { keys: { personal: { prefix: (d) => `notes_mcp_${d}_`, maxDays: n } } })).toThrow('keys.personal.maxDays')
+      expect(() => tenantServer(O.memoryKv(), { keys: { service: { prefix: (d) => `notes_svc_${d}_`, maxDays: n } } })).toThrow('keys.service.maxDays')
+      expect(() => tenantServer(O.memoryKv(), { registration: { enabled: true, perHourPerIp: n } })).toThrow('registration.perHourPerIp')
+      expect(() => tenantServer(O.memoryKv(), { registration: { enabled: true, perHourPer48: n } })).toThrow('registration.perHourPer48')
+      expect(() => tenantServer(O.memoryKv(), { registration: { enabled: true, clientTtlDays: n } })).toThrow('registration.clientTtlDays')
+      expect(() => tenantServer(O.memoryKv(), { turnstile: { siteKey: 'sk', verify: () => false, after: n } })).toThrow('turnstile.after')
+      expect(() => tenantServer(O.memoryKv(), { ttl: { accessSeconds: n } })).toThrow('ttl.accessSeconds')
+      expect(() => tenantServer(O.memoryKv(), { ttl: { refreshSeconds: n } })).toThrow('ttl.refreshSeconds')
+      expect(() => O.signInCodes(O.memoryKv(), { ttlSeconds: n })).toThrow('ttlSeconds')
+      expect(() => new O.Keys<'org'>(O.memoryKv(), ['org'], { personal: { prefix: () => 'a_b_', maxDays: n } })).toThrow('maxDays')
+    }
+    expect(() => tenantServer(O.memoryKv(), { ttl: { accessSeconds: 59 } })).toThrow('at least 60')
+  })
+
+  test('the proofs: a ten-year key, no registration limit, no Turnstile', async () => {
+    expect(() => tenantServer(O.memoryKv(), { keys: { personal: { prefix: (d) => `notes_mcp_${d}_`, maxDays: Number(undefined) } } })).toThrow()
+    expect(() => tenantServer(O.memoryKv(), { registration: { enabled: true, perHourPerIp: Number('') + Number.NaN } })).toThrow()
+    expect(() => tenantServer(O.memoryKv(), { turnstile: { siteKey: 'sk', verify: () => false, after: Number.NaN } })).toThrow()
+    // Whole numbers still work, and a key past the cap is still refused.
+    const d = tenantServer(O.memoryKv(), { keys: { personal: { prefix: (x) => `notes_mcp_${x}_`, maxDays: 30 } } })
+    await expect(d.oauth.keys.createPersonal({ principal: people.rina!.principal, seat: people.rina!.seats.org!, name: 'k', days: 3650 })).rejects.toThrow('at most 30')
+  })
+})
+
+describe('oauth: round 6 R6-4, api() revokes through the tombstone', () => {
+  test('a grant revoked through api() stays revoked in a stale location', async () => {
+    const kv = kvLocations()
+    const store = O.durableObjectRefreshStore(fakeNamespace())
+    const x = tenantServer(kv.x, { refresh: { store } })
+    const y = tenantServer(kv.y, { refresh: { store } })
+    const t = await connected(x as any)
+    const r1 = await refresh(y as any, t.clientId, t.refresh)
+    expect(r1.res.status).toBe(200)
+    await x.oauth.api().revokeGrant(grantOf(t.refresh), 'rina')
+    setSystemTime(new Date(Date.now() + 5_000))
+    expect((await refresh(y as any, t.clientId, r1.body.refresh_token)).res.status).toBe(400)
+    setSystemTime(new Date(Date.now() + 120_000))
+    expect(await kv.central.get(`grant:rina:${grantOf(t.refresh)}`)).toBeNull()
+    expect(await store.tombstoned(grantOf(t.refresh))).not.toBeNull()
+  })
+
+  test('api().deleteClient buries every grant of the client, one made seconds ago too', async () => {
+    const kv = kvLocations()
+    const store = O.durableObjectRefreshStore(fakeNamespace())
+    const x = tenantServer(kv.x, { refresh: { store } })
+    const y = tenantServer(kv.y, { refresh: { store } })
+    const c = await client(x.oauth)
+    const a = await authorize(x as any, c.clientId)
+    const t = await exchange(x as any, c.clientId, a.to.searchParams.get('code')!, a.verifier)
+    expect(t.res.status).toBe(200)
+    const r1 = await refresh(y as any, c.clientId, t.body.refresh_token)
+    expect(r1.res.status).toBe(200)
+    await x.oauth.api().deleteClient(c.clientId)
+    expect(await store.tombstoned(grantOf(t.body.refresh_token))).not.toBeNull()
+    expect(await y.oauth.resolveSeat('org', r1.body.access_token, req())).toBeNull()
+    expect((await refresh(y as any, c.clientId, r1.body.refresh_token)).res.status).toBe(400)
+    // Every other helper still works through the wrapper.
+    expect(await x.oauth.api().lookupClient(c.clientId)).toBeNull()
+  })
+})
+
+describe('oauth: round 6 notes', () => {
+  test('signInCodes with the store: a code is single use across locations', async () => {
+    const person = { kind: 'member', id: 'rina' } as Principal
+    for (const withStore of [false, true]) {
+      const kv = kvLocations()
+      const store = O.durableObjectRefreshStore(fakeNamespace())
+      const x = O.signInCodes(kv.x, withStore ? { store } : {})
+      const y = O.signInCodes(kv.y, withStore ? { store } : {})
+      const code = await x.issue(person, { state: 'st-1' })
+      // Location Y has read the code record, so its cache holds it for a minute.
+      expect(await kv.y.get(`omazy-oauth:signin:${await sha256Hex(code)}`)).not.toBeNull()
+      expect(await x.redeem(code, 'st-1')).toEqual(person)
+      // Without the store, Y redeems it a second time from its cache.
+      expect(await y.redeem(code, 'st-1')).toEqual(withStore ? null : person)
+    }
   })
 })

@@ -291,7 +291,7 @@ function wranglerConfig(o, kits) {
     '// `wrangler dev`.',
   ]
   if (has('oauth')) {
-    head.push('//', '// OAUTH is "off". Read the oauth kit page before you turn it on: its fixes still', '// need a final security review before a door opens with it.')
+    head.push('//', '// OAUTH is "off". Read the oauth kit page before you turn it on, and follow its', '// setup rules: platformDoors, known clients, checkSeat, a consistent refresh store.')
   }
   return `${head.join('\n')}\n${JSON.stringify(cfg, null, 2)}\n`
 }

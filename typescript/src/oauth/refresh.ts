@@ -21,8 +21,16 @@
 // in-memory lock) and leaves the others open: its tombstone sits in the same
 // cache as the grant. A Durable Object or D1 closes all three: each answers
 // from one place, in order.
+//
+// The store also keeps what KV's listing cannot give at once: an index per
+// person (and per client) of the grants and keys made for them, written when
+// each is made, and a mark per person that refuses everything made before a
+// moment. KV's `list()` can miss a key written in the last minute or so, so a
+// revocation that finds its targets by listing KV misses what was just made.
+// And a key's revocation is a tombstone here too: a key record deleted from
+// KV can be read, or written back, from a location whose cache still holds it.
 
-import { KV_MIN_TTL, KV_PREFIX, type KvLike } from './kv.js'
+import { KV_MIN_TTL, KV_PREFIX, type KvLike, listAll } from './kv.js'
 import type { D1DatabaseLike } from '../guard/d1.js'
 
 /** Who a rotated refresh token belonged to. */
@@ -30,6 +38,41 @@ export interface RetiredRefresh {
   userId: string
   grantId: string
 }
+
+/** A grant or key in a person's index, or a grant in a client's. */
+export interface IndexEntry {
+  kind: 'grant' | 'key'
+  id: string
+  door: string
+  tenant: string | null
+  /** In a client's index, the person the grant belongs to. */
+  owner?: string
+  /** For a key, the hash of its secret, where its record is found. */
+  ref?: string
+  /** Milliseconds since the epoch; the entry may be dropped after. */
+  until: number
+}
+
+/**
+ * A person's revocation: everything made for them before `before`
+ * (milliseconds since the epoch) at this door and tenant is refused. A null
+ * door or tenant means any.
+ */
+export interface PersonRevocation {
+  before: number
+  door: string | null
+  tenant: string | null
+}
+
+/** Whether a revocation covers something made at `at` for this door and tenant. */
+export function revocationCovers(marks: readonly PersonRevocation[], item: { door: string; tenant: string | null; at: number }): boolean {
+  return marks.some((m) => (m.door === null || m.door === item.door) && (m.tenant === null || m.tenant === item.tenant) && item.at < m.before)
+}
+
+/** The index of a person's grants and keys. */
+export const personIndex = (personId: string): string => `person:${personId}`
+/** Where a key's tombstone is kept, apart from any grant's. */
+export const keyTombstone = (keyId: string): string => `key:${keyId}`
 
 export interface RefreshStore {
   /** True when every read sees every earlier write, from anywhere: a Durable Object or D1. False for KV. */
@@ -47,6 +90,45 @@ export interface RefreshStore {
   tombstone(grantId: string, owner: RetiredRefresh, ttlSeconds: number): Promise<void>
   /** The owner of a revoked grant, or null when it was never revoked (or the tombstone expired). */
   tombstoned(grantId: string): Promise<RetiredRefresh | null>
+  /** Adds or renews an entry in an index (`person:<id>`, or a client's), keyed by the entry's id. */
+  indexPut(index: string, entry: IndexEntry): Promise<void>
+  indexDelete(index: string, id: string): Promise<void>
+  /** Every entry of an index that has not expired. */
+  indexList(index: string): Promise<IndexEntry[]>
+  /** Records a person's revocation for `ttlSeconds`. For the same door and tenant the later `before` is kept. */
+  revokePerson(personId: string, revocation: PersonRevocation, ttlSeconds: number): Promise<void>
+  /** A person's revocations that have not expired. */
+  personRevocations(personId: string): Promise<PersonRevocation[]>
+}
+
+/** What `Keys` needs from a store: key tombstones, the person index and person revocations. */
+export type KeyStore = Pick<RefreshStore, 'consistent' | 'tombstone' | 'tombstoned' | 'indexPut' | 'indexDelete' | 'indexList' | 'personRevocations'>
+
+const okEntry = (e: unknown): e is IndexEntry => {
+  const x = e as IndexEntry | null
+  return (
+    !!x &&
+    (x.kind === 'grant' || x.kind === 'key') &&
+    typeof x.id === 'string' &&
+    x.id.length > 0 &&
+    typeof x.door === 'string' &&
+    (x.tenant === null || typeof x.tenant === 'string') &&
+    (x.owner === undefined || typeof x.owner === 'string') &&
+    (x.ref === undefined || typeof x.ref === 'string') &&
+    Number.isFinite(x.until)
+  )
+}
+const okRevocation = (r: unknown): r is PersonRevocation => {
+  const x = r as PersonRevocation | null
+  return !!x && Number.isFinite(x.before) && (x.door === null || typeof x.door === 'string') && (x.tenant === null || typeof x.tenant === 'string')
+}
+/** One revocation per door and tenant: the later `before` and the later expiry. */
+function mergeRevocation(list: (PersonRevocation & { until: number })[], r: PersonRevocation, until: number): (PersonRevocation & { until: number })[] {
+  const now = Date.now()
+  const out = list.filter((m) => m.until > now && !(m.door === r.door && m.tenant === r.tenant))
+  const cur = list.find((m) => m.until > now && m.door === r.door && m.tenant === r.tenant)
+  out.push({ before: Math.max(r.before, cur?.before ?? 0), door: r.door, tenant: r.tenant, until: Math.max(until, cur?.until ?? 0) })
+  return out
 }
 
 const newHolder = (): string => {
@@ -83,6 +165,9 @@ function isolateUnlock(key: string, holder: string): void {
 export function kvRefreshStore(kv: KvLike): RefreshStore {
   const key = (hash: string) => `${KV_PREFIX}rt:${hash}`
   const grave = (grantId: string) => `${KV_PREFIX}gt:${grantId}`
+  const entryKey = (index: string, id = '') => `${KV_PREFIX}ix:${index}|${id}`
+  const marksKey = (personId: string) => `${KV_PREFIX}pmark:${personId}`
+  const expiry = (untilMs: number) => Math.max(Math.floor(Date.now() / 1000) + KV_MIN_TTL, Math.ceil(untilMs / 1000))
   return {
     consistent: false,
     async lock(grantId, ms) {
@@ -106,6 +191,29 @@ export function kvRefreshStore(kv: KvLike): RefreshStore {
     async tombstoned(grantId) {
       return ((await kv.get(grave(grantId), { type: 'json' })) as RetiredRefresh | null) ?? null
     },
+    async indexPut(index, entry) {
+      if (!okEntry(entry)) throw new Error('oauth: a bad index entry')
+      await kv.put(entryKey(index, entry.id), JSON.stringify(entry), { expiration: expiry(entry.until) })
+    },
+    async indexDelete(index, id) {
+      await kv.delete(entryKey(index, id))
+    },
+    // A KV listing can miss what was written in the last minute or so: this store is not consistent.
+    async indexList(index) {
+      const now = Date.now()
+      const rows = await Promise.all((await listAll(kv, entryKey(index))).map((k) => kv.get(k.name, { type: 'json' }) as Promise<IndexEntry | null>))
+      return rows.filter((e): e is IndexEntry => okEntry(e) && e.until > now)
+    },
+    async revokePerson(personId, r, ttl) {
+      const cur = ((await kv.get(marksKey(personId), { type: 'json' })) as (PersonRevocation & { until: number })[] | null) ?? []
+      const next = mergeRevocation(Array.isArray(cur) ? cur : [], r, Date.now() + ttl * 1000)
+      await kv.put(marksKey(personId), JSON.stringify(next), { expiration: expiry(Math.max(...next.map((m) => m.until))) })
+    },
+    async personRevocations(personId) {
+      const cur = (await kv.get(marksKey(personId), { type: 'json' })) as (PersonRevocation & { until: number })[] | null
+      const now = Date.now()
+      return (Array.isArray(cur) ? cur : []).filter((m) => okRevocation(m) && m.until > now).map(({ before, door, tenant }) => ({ before, door, tenant }))
+    },
   }
 }
 
@@ -128,6 +236,15 @@ export const OAUTH_D1_MIGRATIONS: readonly { id: string; sql: readonly string[] 
       'CREATE INDEX IF NOT EXISTS omazy_oauth_grant_tombstone_until ON omazy_oauth_grant_tombstone (until_ms)',
     ],
   },
+  {
+    id: '0003_oauth_person_index',
+    sql: [
+      'CREATE TABLE IF NOT EXISTS omazy_oauth_index (index_name TEXT NOT NULL, item_id TEXT NOT NULL, entry TEXT NOT NULL, until_ms INTEGER NOT NULL, PRIMARY KEY (index_name, item_id))',
+      'CREATE INDEX IF NOT EXISTS omazy_oauth_index_until ON omazy_oauth_index (until_ms)',
+      "CREATE TABLE IF NOT EXISTS omazy_oauth_person_revoked (person_id TEXT NOT NULL, door TEXT NOT NULL, tenant TEXT NOT NULL, before_ms INTEGER NOT NULL, until_ms INTEGER NOT NULL, PRIMARY KEY (person_id, door, tenant))",
+      'CREATE INDEX IF NOT EXISTS omazy_oauth_person_revoked_until ON omazy_oauth_person_revoked (until_ms)',
+    ],
+  },
 ])
 
 /** Creates the tables if they are missing. Safe to run on every deploy. */
@@ -136,7 +253,7 @@ export async function applyOAuthD1Migrations(db: D1DatabaseLike): Promise<void> 
 }
 
 export interface D1RefreshStore extends RefreshStore {
-  /** Deletes expired locks, marks and tombstones. For a daily cron. */
+  /** Deletes expired locks, marks, tombstones, index entries and person revocations. For a daily cron. */
   prune(now?: number): Promise<number>
 }
 
@@ -195,9 +312,42 @@ export function d1RefreshStore(db: D1DatabaseLike): D1RefreshStore {
         .first<{ user_id: string; grant_id: string }>()
       return row ? { userId: row.user_id, grantId: row.grant_id } : null
     },
+    async indexPut(index, entry) {
+      if (!okEntry(entry)) throw new Error('oauth: a bad index entry')
+      await db
+        .prepare('INSERT OR REPLACE INTO omazy_oauth_index (index_name, item_id, entry, until_ms) VALUES (?1, ?2, ?3, ?4)')
+        .bind(index, entry.id, JSON.stringify(entry), entry.until)
+        .run()
+    },
+    async indexDelete(index, id) {
+      await db.prepare('DELETE FROM omazy_oauth_index WHERE index_name = ?1 AND item_id = ?2').bind(index, id).run()
+    },
+    async indexList(index) {
+      const r = await db.prepare('SELECT entry FROM omazy_oauth_index WHERE index_name = ?1 AND until_ms > ?2').bind(index, Date.now()).all<{ entry: string }>()
+      return (r.results ?? []).map((x) => JSON.parse(x.entry) as unknown).filter(okEntry)
+    },
+    // An empty door or tenant means any: a door name is never empty, nor is a tenant a revocation names.
+    async revokePerson(personId, r, ttl) {
+      if (!okRevocation(r)) throw new Error('oauth: a bad person revocation')
+      await db
+        .prepare(
+          `INSERT INTO omazy_oauth_person_revoked (person_id, door, tenant, before_ms, until_ms) VALUES (?1, ?2, ?3, ?4, ?5)
+           ON CONFLICT(person_id, door, tenant) DO UPDATE SET before_ms = MAX(omazy_oauth_person_revoked.before_ms, excluded.before_ms),
+             until_ms = MAX(omazy_oauth_person_revoked.until_ms, excluded.until_ms)`,
+        )
+        .bind(personId, r.door ?? '', r.tenant ?? '', r.before, Date.now() + ttl * 1000)
+        .run()
+    },
+    async personRevocations(personId) {
+      const r = await db
+        .prepare('SELECT door, tenant, before_ms FROM omazy_oauth_person_revoked WHERE person_id = ?1 AND until_ms > ?2')
+        .bind(personId, Date.now())
+        .all<{ door: string; tenant: string; before_ms: number }>()
+      return (r.results ?? []).map((x) => ({ before: Number(x.before_ms), door: x.door || null, tenant: x.tenant || null }))
+    },
     async prune(now = Date.now()) {
       let n = 0
-      for (const t of ['omazy_oauth_refresh_lock', 'omazy_oauth_refresh_retired', 'omazy_oauth_grant_tombstone'])
+      for (const t of ['omazy_oauth_refresh_lock', 'omazy_oauth_refresh_retired', 'omazy_oauth_grant_tombstone', 'omazy_oauth_index', 'omazy_oauth_person_revoked'])
         n += (await db.prepare(`DELETE FROM ${t} WHERE until_ms <= ?1`).bind(now).run()).meta?.changes ?? 0
       return n
     },
@@ -230,13 +380,20 @@ type LockOp =
   | { op: 'forget'; hash: string }
   | { op: 'tombstone'; owner: RetiredRefresh; ttl: number }
   | { op: 'tombstoned' }
+  | { op: 'index-put'; entry: IndexEntry }
+  | { op: 'index-delete'; id: string }
+  | { op: 'index-list' }
+  | { op: 'revoke-person'; revocation: PersonRevocation; ttl: number }
+  | { op: 'person-revocations' }
 
 const ok = (body: unknown) => new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } })
 const HASH = /^[0-9a-f]{64}$/
 
 /**
  * A Durable Object, one per grant, holding that grant's refresh lock, the
- * marks of its rotated tokens and, once revoked, its tombstone. A Durable Object runs one request's storage
+ * marks of its rotated tokens and, once revoked, its tombstone. The same class
+ * serves a key's tombstone (`key:<id>`), a person's index and revocations
+ * (`person:<id>`) and a client's index. A Durable Object runs one request's storage
  * reads and writes without another request in between, so the lock is
  * exact. Export it from the Worker and bind it:
  *
@@ -306,14 +463,53 @@ export class OAuthRefreshLock {
         const rec = await s.get<{ owner: RetiredRefresh; until: number }>('tombstone')
         return ok({ owner: rec && rec.until > now ? rec.owner : null })
       }
+      case 'index-put': {
+        if (!okEntry(op.entry)) break
+        const e = op.entry
+        await s.put(`ix:${e.id}`, { kind: e.kind, id: e.id, door: e.door, tenant: e.tenant, ...(e.owner !== undefined ? { owner: e.owner } : {}), ...(e.ref !== undefined ? { ref: e.ref } : {}), until: e.until })
+        await this.alarmAt(e.until)
+        return ok({})
+      }
+      case 'index-delete': {
+        if (typeof op.id !== 'string') break
+        await s.delete(`ix:${op.id}`)
+        return ok({})
+      }
+      case 'index-list': {
+        const out: IndexEntry[] = []
+        for (const v of (await s.list<IndexEntry>({ prefix: 'ix:' })).values()) if (okEntry(v) && v.until > now) out.push(v)
+        return ok({ entries: out })
+      }
+      case 'revoke-person': {
+        if (!okRevocation(op.revocation) || !Number.isFinite(op.ttl)) break
+        const r = op.revocation
+        const key = `pr:${JSON.stringify([r.door, r.tenant])}`
+        const cur = await s.get<PersonRevocation & { until: number }>(key)
+        const [next] = mergeRevocation(cur ? [cur] : [], { before: r.before, door: r.door, tenant: r.tenant }, now + op.ttl * 1000)
+        await s.put(key, next)
+        await this.alarmAt(next!.until)
+        return ok({})
+      }
+      case 'person-revocations': {
+        const out: PersonRevocation[] = []
+        for (const v of (await s.list<PersonRevocation & { until: number }>({ prefix: 'pr:' })).values())
+          if (okRevocation(v) && v.until > now) out.push({ before: v.before, door: v.door, tenant: v.tenant })
+        return ok({ revocations: out })
+      }
     }
     return new Response('bad request', { status: 400 })
   }
 
-  /** Deletes expired marks and an expired tombstone; the alarm is set to the latest expiry. */
+  private async alarmAt(until: number): Promise<void> {
+    const alarm = await this.state.storage.getAlarm()
+    if (alarm === null || alarm < until) await this.state.storage.setAlarm(until)
+  }
+
+  /** Deletes expired marks, index entries, revocations and an expired tombstone; the alarm is set to the latest expiry. */
   async alarm(): Promise<void> {
     const now = Date.now()
-    for (const [k, v] of await this.state.storage.list<{ until: number }>({ prefix: 'rt:' })) if (v.until <= now) await this.state.storage.delete(k)
+    for (const prefix of ['rt:', 'ix:', 'pr:'])
+      for (const [k, v] of await this.state.storage.list<{ until: number }>({ prefix })) if (v.until <= now) await this.state.storage.delete(k)
     const t = await this.state.storage.get<{ until: number }>('tombstone')
     if (t && t.until <= now) await this.state.storage.delete('tombstone')
   }
@@ -348,6 +544,21 @@ export function durableObjectRefreshStore(ns: DurableObjectNamespaceLike): Refre
     },
     async tombstoned(grantId) {
       return (await call<{ owner: RetiredRefresh | null }>(grantId, { op: 'tombstoned' })).owner
+    },
+    async indexPut(index, entry) {
+      await call(index, { op: 'index-put', entry })
+    },
+    async indexDelete(index, id) {
+      await call(index, { op: 'index-delete', id })
+    },
+    async indexList(index) {
+      return (await call<{ entries: IndexEntry[] }>(index, { op: 'index-list' })).entries
+    },
+    async revokePerson(personId, revocation, ttl) {
+      await call(personIndex(personId), { op: 'revoke-person', revocation, ttl })
+    },
+    async personRevocations(personId) {
+      return (await call<{ revocations: PersonRevocation[] }>(personIndex(personId), { op: 'person-revocations' })).revocations
     },
   }
 }

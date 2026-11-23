@@ -14,16 +14,18 @@ import {
   authorizationErrorRedirect,
   CimdFetchError,
   OAuthAuthorizationServer,
+  OAuthError,
   type OAuthHelpers,
+  type TokenExchangeCallbackOptions,
 } from '@cloudflare/workers-oauth-provider'
 import type { Principal, Seat } from '../capabilities/capability.js'
 import { sha256Hex } from '../guard/crypto.js'
 import type { RateLimitBinding } from '../guard/ratelimit.js'
 import type { SeatGrant } from '../mcp/server.js'
 import { type ClientStatus, consentPage, messagePage, newNonce, pageHeaders } from './consent.js'
-import { type KeyInfo, type KeyOptions, Keys } from './keys.js'
-import { bump, KV_MIN_TTL, type KvLike, peek, SAFE_ID } from './kv.js'
-import { kvRefreshStore, type RefreshStore } from './refresh.js'
+import { type KeyInfo, type KeyOptions, Keys, SERVICE_MAX_DAYS } from './keys.js'
+import { bump, KV_MIN_TTL, type KvLike, listAll, peek, SAFE_ID, wholeNumber } from './kv.js'
+import { kvRefreshStore, type PersonRevocation, personIndex, type RefreshStore, revocationCovers } from './refresh.js'
 import { CLIENT_AUTH_PARAMS, tokenForm, tokenRequestClient } from './token-request.js'
 
 /** The one scope the server grants. It means "this seat at this door"; what the seat may do is read live. */
@@ -64,6 +66,8 @@ export type OAuthEvent =
   | { type: 'refresh_reuse'; userId: string; grantId: string }
   | { type: 'code_reuse'; userId: string; grantId: string }
   | { type: 'refresh_contended'; userId: string; grantId: string }
+  // A grant refused at a refresh or code exchange and revoked: `checkSeat` said the seat is gone, or `personLostRole` covered it.
+  | { type: 'grant_revoked'; userId: string; grantId: string; reason: 'seat_gone' | 'person_revoked' }
   | { type: 'client_blocked'; door: string; clientId: string; status: ClientStatus }
   | { type: 'client_metadata_refused'; clientId: string; reason: 'redirect' | 'unreadable' | 'mismatch' }
   // `ip` is the bucket that ran out: an IPv4 address, an IPv6 /64 such as `2001:db8:1:2::/64`, or a /48 such as `2001:db8:1::/48`.
@@ -110,12 +114,16 @@ export interface AuthorizationServerOptions<D extends string> {
   /** Which seat this person takes at this door: for a tenant door, which tenant. Null refuses. */
   chooseSeat: (person: Principal, door: D, req: Request) => Seat | null | Promise<Seat | null>
   /**
-   * Checked on every call before a seat is used: return false when the seat
-   * is gone (the person left the tenant, lost the platform role). Permissions
-   * themselves are read by the guard's `can()` on every call. Required when
-   * there is a platform door; without it the kit warns at start.
+   * Required. Whether the seat is still held (the person is still in the
+   * tenant, still has the platform role). Run on every `resolveSeat`, for an
+   * access token or a key, and on every refresh and code exchange. False at
+   * `resolveSeat` refuses the call; false at a refresh or code exchange
+   * revokes the grant (event `grant_revoked`, reason `seat_gone`). A throw
+   * refuses the call, and at the token endpoint answers 503 and revokes
+   * nothing. Permissions themselves are read by the guard's `can()` on every
+   * call.
    */
-  checkSeat?: (grant: SeatGrant, door: D, req: Request) => boolean | Promise<boolean>
+  checkSeat: (grant: SeatGrant, door: D, req: Request) => boolean | Promise<boolean>
   /**
    * Client policy per door. A tenant door without one allows verified
    * clients and blocks unverified ones. A platform door needs one, with a
@@ -179,7 +187,7 @@ export interface AuthorizationServerOptions<D extends string> {
    * request can name a new address and get a fresh bucket.
    */
   trustClientIpHeader?: boolean
-  /** Turnstile on the consent page once an address has opened it `after` times in an hour (default 3). */
+  /** Turnstile on the consent page once an address has opened it `after` times in an hour (a whole number, default 3). */
   turnstile?: { siteKey: string; verify: (token: string, ip: string | null) => boolean | Promise<boolean>; after?: number }
   keys?: KeyOptions<D>
   /**
@@ -198,9 +206,14 @@ export interface AuthorizationServerOptions<D extends string> {
    * from another isolate takes up to that long to stop an access token.
    * Refreshes, code exchanges and connected apps always read the store, and
    * a revocation made by this server instance applies at once.
+   *
+   * The store also holds each person's index of grants and keys and the
+   * revocations `personLostRole` writes, and the keys' tombstones. On the KV
+   * default those have the KV delay too: the kit warns at start when a
+   * tenant door uses it, unless `acceptKvRace` is set.
    */
   refresh?: { store?: RefreshStore; acceptKvRace?: boolean; tombstoneCacheSeconds?: number }
-  /** Shorter lifetimes only: access at most 1 hour, refresh at most 30 days. */
+  /** Shorter lifetimes only, in whole seconds, at least 60: access at most 1 hour, refresh at most 30 days. */
   ttl?: { accessSeconds?: number; refreshSeconds?: number }
   onEvent?: (event: OAuthEvent) => void
 }
@@ -243,23 +256,34 @@ export interface OAuthServer<D extends string> {
   resourceMetadataUrl(door: D): string
   /** Every app and key a person has connected, with last use. */
   connectedApps(personId: string): Promise<ConnectedApps>
-  /** Disconnects one app. False when the person has no such grant. */
+  /** Disconnects one app: tombstone, then revocation. False when the person has no such grant. */
   revokeApp(personId: string, grantId: string): Promise<boolean>
   /** Personal and service keys. */
   keys: Keys<D>
   /**
    * Call when a person loses a role: revokes their grants and keys, at one
    * door or tenant if given. Service keys they own go too unless moved first
-   * with `keys.transferService`.
+   * with `keys.transferService`. First it records in the refresh store that
+   * everything made for the person there before now is revoked, checked at
+   * every refresh, code exchange and `resolveSeat`, so a grant or key the
+   * listing missed is refused too. Then it revokes each grant and key found
+   * through the person's index in the store and KV's listing.
    */
   personLostRole(personId: string, filter?: { door?: D; tenant?: string }): Promise<{ grants: number; keys: number }>
-  /** The library's helpers, for pre-registering clients and purging expired data from a cron. */
+  /**
+   * The library's helpers, for pre-registering clients and purging expired
+   * data from a cron. `revokeGrant` and `deleteClient` go through the kit:
+   * each grant gets its tombstone first, as `revokeApp` does, and
+   * `deleteClient` revokes every grant of the client before it deletes it.
+   */
   api(): OAuthHelpers
 }
 
 interface GrantProps {
   principal: Principal
   seat: Seat
+  /** When the sign-in that made the grant began (ms). A person's revocation covers the grant when it came after. */
+  at?: number
 }
 
 /** Which list made a client known at consent: its exact id, or its metadata host under `knownDomains`. */
@@ -272,6 +296,8 @@ interface GrantMeta {
   clientName: string
   status: ClientStatus
   knownBy?: KnownBy
+  /** As `GrantProps.at`. */
+  at?: number
 }
 
 /** The part of the library's grant record the kit reads. */
@@ -284,6 +310,9 @@ interface StoredGrant {
   refreshTokenId?: string
   previousRefreshTokenId?: string
   metadata?: Partial<GrantMeta>
+  /** Seconds since the epoch. */
+  createdAt?: number
+  expiresAt?: number
 }
 
 interface UpstreamData {
@@ -293,7 +322,13 @@ interface UpstreamData {
   knownBy?: KnownBy
 }
 
-type LibEnv = { OAUTH_KV: KvLike }
+/** The token request the library is answering, for `checkSeat`, and whether the kit refused it before anything rotated. */
+interface TokenCall {
+  req: Request
+  unrotated: boolean
+}
+
+type LibEnv = { OAUTH_KV: KvLike; omazyTokenCall?: TokenCall }
 
 const json = (body: unknown, status: number, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', ...headers } })
@@ -307,6 +342,23 @@ const warnOnce = (msg: string) => {
 
 
 const grantUseKey = (grantId: string) => `grant-${grantId}`
+
+/**
+ * How long a person's revocation is kept: past the last day of anything it
+ * covers. A key lives at most a year; a grant dies at its first use after the
+ * revocation, or when its refresh token expires unused.
+ */
+const PERSON_REVOCATION_TTL = (SERVICE_MAX_DAYS + 1) * 86_400
+
+/** A grant of a person, read from KV's listing or through the person's index. */
+interface PersonGrant {
+  id: string
+  clientId: string
+  metadata?: Partial<GrantMeta>
+  /** Seconds since the epoch. */
+  createdAt: number
+  expiresAt?: number
+}
 
 function checkResource(door: string, r: string): string {
   let u: URL
@@ -522,9 +574,13 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
     resourceOf[d] = checkResource(d, opts.doors[d])
     doorOf.set(resourceOf[d], d)
   }
-  const accessTtl = Math.min(opts.ttl?.accessSeconds ?? ACCESS_TTL_SECONDS, ACCESS_TTL_SECONDS)
-  const refreshTtl = Math.min(opts.ttl?.refreshSeconds ?? REFRESH_TTL_SECONDS, REFRESH_TTL_SECONDS)
-  if (accessTtl < KV_MIN_TTL || refreshTtl < KV_MIN_TTL) throw new Error('oauth: token lifetimes must be at least 60 seconds')
+  // Every numeric option is a whole number, checked here: NaN passes any comparison and lifts the limit it sets.
+  const accessTtl = Math.min(wholeNumber('ttl.accessSeconds', opts.ttl?.accessSeconds, KV_MIN_TTL) ?? ACCESS_TTL_SECONDS, ACCESS_TTL_SECONDS)
+  const refreshTtl = Math.min(wholeNumber('ttl.refreshSeconds', opts.ttl?.refreshSeconds, KV_MIN_TTL) ?? REFRESH_TTL_SECONDS, REFRESH_TTL_SECONDS)
+  const perHourPerIp = wholeNumber('registration.perHourPerIp', opts.registration?.perHourPerIp) ?? 10
+  const perHourPer48 = wholeNumber('registration.perHourPer48', opts.registration?.perHourPer48) ?? perHourPerIp * 10
+  const clientTtlDays = wholeNumber('registration.clientTtlDays', opts.registration?.clientTtlDays) ?? 90
+  const turnstileAfter = wholeNumber('turnstile.after', opts.turnstile?.after) ?? 3
   const registration = opts.registration?.enabled === true
   const ipHeader = opts.clientIpHeader ?? 'cf-connecting-ip'
   if (!/^[a-z0-9-]{1,64}$/i.test(ipHeader)) throw new Error('oauth: clientIpHeader must be a header name')
@@ -536,8 +592,10 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
   const platformDoors = new Set<D>(opts.platformDoors)
   for (const d of platformDoors) if (!doorNames.includes(d)) throw new Error(`oauth: platform door ${d} is not a door`)
   for (const d of doorNames) checkPolicy(d, opts.clients?.[d], platformDoors.has(d))
-  if (platformDoors.size > 0 && !opts.checkSeat) throw new Error('oauth: a platform door needs checkSeat, so a lost platform role refuses its tokens')
-  if (!opts.checkSeat) warnOnce('oauth: no checkSeat: a removed seat keeps working until its access token expires')
+  if (typeof opts.checkSeat !== 'function')
+    throw new Error(
+      'oauth: checkSeat is required at every door: without it a seat the person no longer holds keeps its keys and access tokens, and its grants keep refreshing until revoked',
+    )
   if (!opts.rateLimit?.authorize) warnOnce('oauth: no rateLimit.authorize: GET /authorize writes to KV with no limit per address')
   if (!opts.rateLimit?.token) warnOnce('oauth: no rateLimit.token: the token endpoint has no limit per address')
   if ((opts.rateLimit?.authorize && !opts.rateLimit.authorizePer48) || (opts.rateLimit?.token && !opts.rateLimit.tokenPer48))
@@ -554,6 +612,11 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
   if (platformDoors.size > 0 && !refreshStore.consistent && opts.refresh?.acceptKvRace !== true)
     throw new Error(
       'oauth: a platform door needs a consistent refresh store (durableObjectRefreshStore or d1RefreshStore); KV lets a replayed refresh token through for about 60 s. Pass refresh: { acceptKvRace: true } to accept that',
+    )
+  const tenantDoors = doorNames.filter((d) => !platformDoors.has(d))
+  if (tenantDoors.length > 0 && !refreshStore.consistent && opts.refresh?.acceptKvRace !== true)
+    warnOnce(
+      `oauth: tenant door ${tenantDoors.join(', ')} uses the KV refresh store: for about 60 s a replayed refresh token passes in another region, and a revoked grant, a revoked key or a person who lost a role keeps working in a location whose KV cache is stale. Use durableObjectRefreshStore or d1RefreshStore, or pass refresh: { acceptKvRace: true } to accept that`,
     )
   const event = (e: OAuthEvent) => {
     try {
@@ -588,14 +651,19 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
     clientIdMetadataDocumentEnabled: opts.clientMetadataDocuments !== false,
     // The library keeps a last-good copy for 24 hours by default, so a withdrawn document kept working.
     clientIdMetadataDocumentFallback: metadataFallback(opts.clientMetadataFallback),
-    ...(registration
-      ? { clientRegistrationEndpoint: paths.register, clientRegistrationTTL: Math.max(1, opts.registration?.clientTtlDays ?? 90) * 86_400 }
-      : {}),
+    ...(registration ? { clientRegistrationEndpoint: paths.register, clientRegistrationTTL: clientTtlDays * 86_400 } : {}),
     onError: (e: { code: string; internal?: { reason?: string } }) => {
       event({ type: 'oauth_error', code: e.code, reason: e.internal?.reason ?? '' })
     },
+    // Runs inside the library before it mints anything for a code, a refresh or an exchange.
+    tokenExchangeCallback: (o: TokenExchangeCallbackOptions<LibEnv>) => beforeMint(o),
   })
   const env: LibEnv = { OAUTH_KV: opts.kv }
+  /** The env for one token request: the callback reads the request from it and marks a refusal there. */
+  const envFor = (req: Request): { env: LibEnv; call: TokenCall } => {
+    const call: TokenCall = { req, unrotated: false }
+    return { env: { OAUTH_KV: opts.kv, omazyTokenCall: call }, call }
+  }
   const helpers = () => lib.getOAuthApi(env)
 
   /**
@@ -607,6 +675,7 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
     untombstoned.delete(grantId)
     await refreshStore.tombstone(grantId, { userId, grantId }, tombstoneTtl)
     await helpers().revokeGrant(grantId, userId)
+    await refreshStore.indexDelete(personIndex(userId), grantId).catch(() => undefined)
   }
 
   /** True when the grant was revoked and has come back through a stale write: it is revoked again. */
@@ -616,21 +685,151 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
     return true
   }
 
-  /** `risen` for `resolveSeat`, with the optional short memory of a grant that has no tombstone. */
-  async function risenOnCall(userId: string, grantId: string): Promise<boolean> {
-    if (tombstoneCacheSeconds === 0) return risen(userId, grantId)
-    const until = untombstoned.get(grantId)
-    if (until !== undefined && until > Date.now()) return false
-    if (await risen(userId, grantId)) {
+  /**
+   * For `resolveSeat`: whether an access token's grant was revoked, by its
+   * tombstone or by a revocation of its person made after the grant. Both are
+   * read at once. With `tombstoneCacheSeconds`, a grant found clear of both is
+   * remembered that long.
+   */
+  async function revokedOnCall(userId: string, grantId: string, item: { door: string; tenant: string | null; at: number }): Promise<boolean> {
+    if (tombstoneCacheSeconds > 0) {
+      const until = untombstoned.get(grantId)
+      if (until !== undefined && until > Date.now()) return false
+    }
+    const [grave, marks] = await Promise.all([refreshStore.tombstoned(grantId), refreshStore.personRevocations(userId)])
+    if (grave) {
+      untombstoned.delete(grantId)
+      await helpers().revokeGrant(grantId, userId)
+      return true
+    }
+    if (revocationCovers(marks, item)) {
       untombstoned.delete(grantId)
       return true
     }
+    if (tombstoneCacheSeconds === 0) return false
     if (untombstoned.size >= 10_000) for (const [k, u] of untombstoned) if (u <= Date.now()) untombstoned.delete(k)
     if (untombstoned.size >= 10_000) untombstoned.delete(untombstoned.keys().next().value!)
     untombstoned.set(grantId, Date.now() + tombstoneCacheSeconds * 1000)
     return false
   }
-  const keys = new Keys<D>(opts.kv, doorNames, opts.keys ?? {}, [...platformDoors])
+
+  /** A client's index of grants, under a hash of its id (a metadata document URL can be long). */
+  const clientIndex = async (clientId: string) => `client:${await sha256Hex(clientId)}`
+
+  /** Enters a grant in its person's index and its client's, or renews the entries, for as long as a tombstone would last. */
+  async function indexGrant(userId: string, grantId: string, clientId: string, door: string, tenant: string | null): Promise<void> {
+    const until = Date.now() + tombstoneTtl * 1000
+    await Promise.all([
+      refreshStore.indexPut(personIndex(userId), { kind: 'grant', id: grantId, door, tenant, until }),
+      clientIndex(clientId).then((ix) => refreshStore.indexPut(ix, { kind: 'grant', id: grantId, owner: userId, door, tenant, until })),
+    ])
+  }
+
+  /**
+   * A person's grants: KV's listing, which can miss one made in the last
+   * minute or so, and the person's index in the refresh store, which holds
+   * every grant from the moment it is made. Also the index entries, for one
+   * whose record this location cannot read.
+   */
+  async function personGrants(personId: string): Promise<{ found: PersonGrant[]; indexed: { id: string; door: string; tenant: string | null }[] }> {
+    const [listed, entries] = await Promise.all([grantsOf(personId), refreshStore.indexList(personIndex(personId))])
+    const found = new Map<string, PersonGrant>()
+    for (const g of listed)
+      found.set(g.id, { id: g.id, clientId: g.clientId, metadata: g.metadata as Partial<GrantMeta> | undefined, createdAt: g.createdAt, ...(g.expiresAt ? { expiresAt: g.expiresAt } : {}) })
+    const indexed = entries.filter((e) => e.kind === 'grant')
+    await Promise.all(
+      indexed
+        .filter((e) => !found.has(e.id))
+        .map(async (e) => {
+          const g = (await opts.kv.get(`grant:${personId}:${e.id}`, { type: 'json' })) as StoredGrant | null
+          if (g?.clientId) found.set(e.id, { id: e.id, clientId: g.clientId, ...(g.metadata ? { metadata: g.metadata } : {}), createdAt: g.createdAt ?? 0, ...(g.expiresAt ? { expiresAt: g.expiresAt } : {}) })
+        }),
+    )
+    return { found: [...found.values()], indexed: indexed.map((e) => ({ id: e.id, door: e.door, tenant: e.tenant })) }
+  }
+
+  /** Whether the seat is still held: `checkSeat`, and a tenantless seat only at a platform door. A throw is `error`, never `gone`. */
+  async function seatState(grant: SeatGrant, door: D, req: Request): Promise<'live' | 'gone' | 'error'> {
+    if (grant.seat.tenant === null && !platformDoors.has(door)) return 'gone'
+    try {
+      return (await opts.checkSeat(grant, door, req)) === true ? 'live' : 'gone'
+    } catch {
+      return 'error'
+    }
+  }
+
+  /**
+   * The library's `tokenExchangeCallback`: it runs before the library mints
+   * anything for a code, a refresh or an exchange, with the grant's props
+   * decrypted, and before it writes the grant back. A grant made before a
+   * revocation of its person (`personLostRole`), or whose seat `checkSeat`
+   * now says is gone, is buried (tombstone, then revocation) and refused with
+   * `invalid_grant`. A store or `checkSeat` that fails answers 503 and
+   * revokes nothing, and the refresh token stays good for the retry. A code
+   * or refresh renews the grant's entries in the person's and client's index.
+   */
+  async function beforeMint(o: TokenExchangeCallbackOptions<LibEnv>): Promise<void> {
+    const call = o.env?.omazyTokenCall
+    const refuse = (e: OAuthError): never => {
+      if (call) call.unrotated = true
+      throw e
+    }
+    const unavailable = () =>
+      new OAuthError('temporarily_unavailable', { description: 'The grant could not be checked; try again shortly', statusCode: 503, headers: { 'retry-after': '5' } })
+    const p = o.props as GrantProps | undefined
+    const door = doorNames.find((d) => d === p?.seat?.door)
+    if (!p?.principal || !p.seat || !door || p.principal.id !== o.userId) return refuse(new OAuthError('invalid_grant', { description: 'The grant names no seat here' }))
+    const revoke = async (reason: 'seat_gone' | 'person_revoked'): Promise<never> => {
+      try {
+        await bury(o.userId, o.grantId)
+      } catch {
+        return refuse(unavailable())
+      }
+      event({ type: 'grant_revoked', userId: o.userId, grantId: o.grantId, reason })
+      return refuse(new OAuthError('invalid_grant', { description: reason === 'seat_gone' ? 'The seat this grant was for is no longer held' : 'The grant was revoked' }))
+    }
+    let marks: PersonRevocation[]
+    try {
+      marks = await refreshStore.personRevocations(o.userId)
+    } catch {
+      return refuse(unavailable())
+    }
+    if (revocationCovers(marks, { door, tenant: p.seat.tenant, at: p.at ?? 0 })) return revoke('person_revoked')
+    const state = await seatState({ principal: p.principal, seat: p.seat }, door, call?.req ?? new Request(paths.token))
+    if (state === 'error') return refuse(unavailable())
+    if (state === 'gone') return revoke('seat_gone')
+    if (String(o.grantType) === 'authorization_code' || String(o.grantType) === 'refresh_token') {
+      try {
+        await indexGrant(o.userId, o.grantId, o.subjectClientId, door, p.seat.tenant)
+      } catch {
+        return refuse(unavailable())
+      }
+    }
+  }
+
+  /**
+   * `api().deleteClient`: every grant of the client is buried before the
+   * library deletes it, found through the client's index in the refresh store
+   * and a listing of every grant in KV (the library's own scan).
+   */
+  async function deleteClient(clientId: string): Promise<void> {
+    const found = new Map<string, string>()
+    for (const e of await refreshStore.indexList(await clientIndex(clientId))) if (e.kind === 'grant' && e.owner) found.set(e.id, e.owner)
+    for (const k of await listAll(opts.kv, 'grant:')) {
+      const rest = k.name.slice('grant:'.length)
+      const i = rest.lastIndexOf(':')
+      if (i <= 0 || i === rest.length - 1) continue
+      const grantId = rest.slice(i + 1)
+      if (found.has(grantId)) continue
+      const meta = k.metadata as { clientId?: unknown } | undefined
+      const owner = typeof meta?.clientId === 'string' ? meta.clientId : ((await opts.kv.get(k.name, { type: 'json' })) as StoredGrant | null)?.clientId
+      if (owner === clientId) found.set(grantId, rest.slice(0, i))
+    }
+    for (const [grantId, userId] of found) await bury(userId, grantId)
+    await helpers().deleteClient(clientId)
+  }
+
+  const keys = new Keys<D>(opts.kv, doorNames, opts.keys ?? {}, [...platformDoors], refreshStore)
 
   const execOf = (exec?: { waitUntil(p: Promise<unknown>): void }) =>
     ({ waitUntil: (p: Promise<unknown>) => exec?.waitUntil(p), passThroughOnException() {}, props: {} }) as never
@@ -904,7 +1103,7 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
     }
 
     const attempts = opts.turnstile && ip ? await bump(opts.kv, 'consent', ip.bucket, 3600) : 0
-    const challenge = !!opts.turnstile && attempts > (opts.turnstile.after ?? 3)
+    const challenge = !!opts.turnstile && attempts > turnstileAfter
     const consent = await helpers().beginConsent(request)
     const nonce = newNonce()
     const html = consentPage(
@@ -940,7 +1139,7 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
       if (opts.turnstile) {
         const ip = ipOf(req)
         if (!ip) return noAddress()
-        if ((await peek(opts.kv, 'consent', ip.bucket, 3600)) > (opts.turnstile.after ?? 3)) {
+        if ((await peek(opts.kv, 'consent', ip.bucket, 3600)) > turnstileAfter) {
           const token = String(form.get('cf-turnstile-response') ?? '')
           if (!token || !(await opts.turnstile.verify(token, ip.ip))) {
             event({ type: 'turnstile_failed', ip: ip.bucket })
@@ -1002,6 +1201,8 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
   }
 
   async function callback(original: Request): Promise<Response> {
+    // Taken before the person is read and the seat chosen: a revocation of the person written after this moment covers the grant.
+    const at = Date.now()
     const req = await callbackRequest(original)
     if (!req) return page(400, 'This sign-in cannot be completed', 'Open the link from the app again.')
     const url = new URL(req.url)
@@ -1057,13 +1258,21 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
     if (!seat || seat.door !== door) return deny('no_seat', 'You have no access here')
     // A seat with no tenant is an operator seat: only a platform door hands one out.
     if (seat.tenant === null && !platformDoors.has(door)) return deny('tenantless_seat', 'You have no access here')
-    const props: GrantProps = { principal: { kind: person.kind, id: person.id, ...(person.name ? { name: person.name } : {}) }, seat }
-    const metadata: GrantMeta = { door, seatId: seat.id, tenant: seat.tenant, clientName: data.clientName, status: data.status, ...(data.knownBy ? { knownBy: data.knownBy } : {}) }
+    const props: GrantProps = { principal: { kind: person.kind, id: person.id, ...(person.name ? { name: person.name } : {}) }, seat, at }
+    const metadata: GrantMeta = { door, seatId: seat.id, tenant: seat.tenant, clientName: data.clientName, status: data.status, ...(data.knownBy ? { knownBy: data.knownBy } : {}), at }
     const { redirectTo } = await helpers().completeAuthorization({ request, userId: person.id, metadata, scope: [OAUTH_SCOPE], props, revokeExistingGrants: false })
-    // One grant per person, client, door and seat: a person with two tenants keeps both.
     const newGrant = new URL(redirectTo).searchParams.get('code')?.split(':')[1]
-    for (const g of await grantsOf(person.id)) {
-      const m = g.metadata as GrantMeta | undefined
+    // In the person's index before the client has the code, so a revocation finds it at once. Fails closed.
+    try {
+      if (!newGrant) throw new Error('no grant')
+      await indexGrant(person.id, newGrant, request.clientId, door, seat.tenant)
+    } catch {
+      if (newGrant) await helpers().revokeGrant(newGrant, person.id).catch(() => undefined)
+      return deny('error')
+    }
+    // One grant per person, client, door and seat: a person with two tenants keeps both.
+    for (const g of (await personGrants(person.id)).found) {
+      const m = g.metadata
       if (g.id !== newGrant && g.clientId === request.clientId && m?.door === door && m?.seatId === seat.id) await bury(person.id, g.id)
     }
     return redirect(redirectTo, headers)
@@ -1127,7 +1336,7 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
   ): Promise<Response> {
     if (!grant.authCodeWrappedKey) return codeReplayed(req, form, owner, grant, exec)
     if (tokenRequestClient(req.headers.get('authorization'), form) !== grant.clientId)
-      return (await refreshStore.retired(owner.grantId, hash)) ? codeReplayed(req, form, owner, grant, exec) : lib.fetch(req, env, execOf(exec))
+      return (await refreshStore.retired(owner.grantId, hash)) ? codeReplayed(req, form, owner, grant, exec) : lib.fetch(req, envFor(req).env, execOf(exec))
     const busy = () => {
       event({ type: 'refresh_contended', userId: owner.userId, grantId: owner.grantId })
       return json({ error: 'temporarily_unavailable', error_description: 'Another request for this grant is in progress; try again shortly' }, 503, { 'retry-after': '5' })
@@ -1141,15 +1350,17 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
       // The pending record names the lock's holder in place of a user.
       await refreshStore.retire(owner.grantId, pending, { userId: holder, grantId: owner.grantId }, CODE_TTL_SECONDS)
       let res: Response
+      const { env: callEnv, call } = envFor(req)
       try {
-        res = await lib.fetch(req, env, execOf(exec))
+        res = await lib.fetch(req, callEnv, execOf(exec))
       } catch (e) {
         await refreshStore.retire(owner.grantId, hash, owner, CODE_TTL_SECONDS)
         await refreshStore.forget(owner.grantId, pending).catch(() => undefined)
         throw e
       }
       // Used first, then the pending record dropped: a failure in between leaves the code used.
-      if (res.status < 400 || res.status >= 500) await refreshStore.retire(owner.grantId, hash, owner, CODE_TTL_SECONDS)
+      // A refusal from `beforeMint` came before the library exchanged anything, so the code is not used.
+      if (!call.unrotated && (res.status < 400 || res.status >= 500)) await refreshStore.retire(owner.grantId, hash, owner, CODE_TTL_SECONDS)
       await refreshStore.forget(owner.grantId, pending).catch(() => undefined)
       if (res.ok) await keys.touch(grantUseKey(owner.grantId))
       return res
@@ -1190,7 +1401,7 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
 
   async function token(req: Request, exec?: { waitUntil(p: Promise<unknown>): void }): Promise<Response> {
     // Anything but a POST is the library's to answer (405, CORS preflight).
-    if (req.method !== 'POST') return lib.fetch(req, env, execOf(exec))
+    if (req.method !== 'POST') return lib.fetch(req, envFor(req).env, execOf(exec))
     if (opts.rateLimit?.token || opts.rateLimit?.tokenPer48) {
       const ip = ipOf(req)
       if (!ip) return noAddressJson()
@@ -1232,8 +1443,8 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
       // library, which refuses it.
       const hash = await sha256Hex(refresh)
       const grant = (await opts.kv.get(`grant:${owner.userId}:${owner.grantId}`, { type: 'json' })) as StoredGrant | null
-      if (!grant) return lib.fetch(req, env, execOf(exec))
-      if (hash !== grant.refreshTokenId && hash !== grant.previousRefreshTokenId) return (await reused(owner, hash)) ?? lib.fetch(req, env, execOf(exec))
+      if (!grant) return lib.fetch(req, envFor(req).env, execOf(exec))
+      if (hash !== grant.refreshTokenId && hash !== grant.previousRefreshTokenId) return (await reused(owner, hash)) ?? lib.fetch(req, envFor(req).env, execOf(exec))
       // A grant revoked elsewhere and written back from a stale cache.
       if (await risen(owner.userId, owner.grantId)) return grantRevoked()
       // A client the door blocks now, or took off its known list, gets no new tokens. The grant stays.
@@ -1256,15 +1467,17 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
         // past the lock. A 4xx means the library did not rotate it: the mark
         // goes. A 5xx or a throw keeps it, failing closed.
         await refreshStore.retire(owner.grantId, hash, owner, refreshTtl)
-        const res = await lib.fetch(req, env, execOf(exec))
+        const { env: callEnv, call } = envFor(req)
+        const res = await lib.fetch(req, callEnv, execOf(exec))
         if (res.ok) await keys.touch(grantUseKey(owner.grantId))
-        else if (res.status >= 400 && res.status < 500) await refreshStore.forget(owner.grantId, hash)
+        // A refusal from `beforeMint` (a 503 included) came before the library rotated anything: the token stays good.
+        else if ((res.status >= 400 && res.status < 500) || call.unrotated) await refreshStore.forget(owner.grantId, hash)
         return res
       } finally {
         await refreshStore.unlock(owner.grantId, holder).catch(() => undefined)
       }
     }
-    return lib.fetch(req, env, execOf(exec))
+    return lib.fetch(req, envFor(req).env, execOf(exec))
   }
 
   /**
@@ -1331,18 +1544,17 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
         return checked
       }
     }
-    return lib.fetch(req, env, execOf(exec))
+    return lib.fetch(req, envFor(req).env, execOf(exec))
   }
 
   async function register(req: Request, exec?: { waitUntil(p: Promise<unknown>): void }): Promise<Response> {
     if (req.method === 'POST') {
       const ip = ipOf(req)
       if (!ip) return noAddressJson()
-      const perIp = opts.registration?.perHourPerIp ?? 10
       const out =
-        (await bump(opts.kv, 'register', ip.bucket, 3600)) > perIp
+        (await bump(opts.kv, 'register', ip.bucket, 3600)) > perHourPerIp
           ? ip.bucket
-          : ip.wide && (await bump(opts.kv, 'register', ip.wide, 3600)) > (opts.registration?.perHourPer48 ?? perIp * 10)
+          : ip.wide && (await bump(opts.kv, 'register', ip.wide, 3600)) > perHourPer48
             ? ip.wide
             : null
       if (out) {
@@ -1350,7 +1562,7 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
         return json({ error: 'too_many_requests', error_description: 'Too many registrations; try again later' }, 429, { 'retry-after': '3600' })
       }
     }
-    return lib.fetch(req, env, execOf(exec))
+    return lib.fetch(req, envFor(req).env, execOf(exec))
   }
 
   function resourceMetadata(door: D): Response {
@@ -1369,15 +1581,7 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
 
   const metadataPaths = new Map<string, D>(doorNames.map((d) => [metadataUrlFor(resourceOf[d]), d]))
 
-  async function live(grant: SeatGrant, door: D, req: Request): Promise<boolean> {
-    if (grant.seat.tenant === null && !platformDoors.has(door)) return false
-    if (!opts.checkSeat) return true
-    try {
-      return (await opts.checkSeat(grant, door, req)) === true
-    } catch {
-      return false
-    }
-  }
+  const live = async (grant: SeatGrant, door: D, req: Request): Promise<boolean> => (await seatState(grant, door, req)) === 'live'
 
   async function resolveSeat(door: D, token: string, req: Request): Promise<SeatGrant | null> {
     if (!token || token.length > 1024 || !doorNames.includes(door)) return null
@@ -1394,8 +1598,9 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
     const p = v.props
     if (!p?.seat || !p.principal || p.seat.door !== door || p.principal.id !== v.userId) return null
     const grant: SeatGrant = { principal: p.principal, seat: p.seat }
-    // An access token of a revoked grant, read from a stale cache or minted by a refresh that wrote the grant back.
-    if (await risenOnCall(v.userId, parts[1]!)) return null
+    // An access token of a revoked grant, read from a stale cache or minted by a refresh that wrote the grant back,
+    // or of a grant made before a revocation of its person.
+    if (await revokedOnCall(v.userId, parts[1]!, { door, tenant: p.seat.tenant, at: (p as GrantProps).at ?? 0 })) return null
     // The client policy as it stands now; the grant record is read only when the lists alone cannot decide.
     const recorded = async () => ((await opts.kv.get(`grant:${v.userId}:${parts[1]!}`, { type: 'json' })) as StoredGrant | null)?.metadata
     if (!(await stillAllowed(door, v.clientId, recorded)).allowed) return null
@@ -1414,7 +1619,7 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
       return resourceMetadata(md)
     }
     if (url.origin === new URL(issuer).origin && (url.pathname.startsWith('/.well-known/oauth-authorization-server') || url.pathname.startsWith('/.well-known/openid-configuration'))) {
-      return lib.fetch(req, env, execOf(exec))
+      return lib.fetch(req, envFor(req).env, execOf(exec))
     }
     if (here === paths.authorize) {
       if (req.method === 'GET') return authorizeGet(req)
@@ -1437,14 +1642,15 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
     resolveSeat,
     resourceMetadataUrl: (door) => metadataUrlFor(resourceOf[door]),
     async connectedApps(personId) {
-      // The tombstone and last use of every grant, and the keys, read at once rather than one after another.
+      // Every grant's tombstone and last use, and the keys, read at once rather than one after another.
       const [rows, keyList] = await Promise.all([
-        grantsOf(personId).then((grants) =>
+        Promise.all([personGrants(personId), refreshStore.personRevocations(personId)]).then(([{ found }, marks]) =>
           Promise.all(
-            grants.map(async (g): Promise<ConnectedApp | null> => {
+            found.map(async (g): Promise<ConnectedApp | null> => {
+              const m = g.metadata ?? {}
+              if (revocationCovers(marks, { door: m.door ?? '', tenant: m.tenant ?? null, at: m.at ?? 0 })) return null
               const [gone, lastUsedAt] = await Promise.all([risen(personId, g.id), keys.lastUse(grantUseKey(g.id))])
               if (gone) return null
-              const m = (g.metadata ?? {}) as Partial<GrantMeta>
               return {
                 grantId: g.id,
                 clientId: g.clientId,
@@ -1465,24 +1671,45 @@ export function authorizationServer<D extends string>(opts: AuthorizationServerO
       return { apps: rows.filter((a): a is ConnectedApp => a !== null), keys: keyList }
     },
     async revokeApp(personId, grantId) {
-      if (!(await grantsOf(personId)).some((g) => g.id === grantId)) return false
+      if (!SAFE_ID.test(personId) || !grantId || grantId.includes(':')) return false
+      // The grant's own record, or the person's index for one made a moment ago: never KV's listing, which lags.
+      const [entries, rec] = await Promise.all([refreshStore.indexList(personIndex(personId)), opts.kv.get(`grant:${personId}:${grantId}`, { type: 'json' })])
+      if (!rec && !entries.some((e) => e.kind === 'grant' && e.id === grantId)) return false
       await bury(personId, grantId)
       return true
     },
     keys,
     async personLostRole(personId, filter = {}) {
+      // The revocation first: a grant or key the index and the listing below miss is refused at its next use.
+      await refreshStore.revokePerson(personId, { before: Date.now(), door: filter.door ?? null, tenant: filter.tenant ?? null }, PERSON_REVOCATION_TTL)
+      untombstoned.clear()
+      const { found, indexed } = await personGrants(personId)
+      const targets = new Map<string, { door: string | undefined; tenant: string | null | undefined }>()
+      for (const g of found) targets.set(g.id, { door: g.metadata?.door, tenant: g.metadata?.tenant })
+      for (const e of indexed) if (!targets.has(e.id)) targets.set(e.id, { door: e.door, tenant: e.tenant })
       let grants = 0
-      for (const g of await grantsOf(personId)) {
-        const m = (g.metadata ?? {}) as Partial<GrantMeta>
-        if (filter.door && m.door !== filter.door) continue
-        if (filter.tenant && m.tenant !== filter.tenant) continue
-        await bury(personId, g.id)
+      for (const [id, t] of targets) {
+        if (filter.door && t.door !== filter.door) continue
+        if (filter.tenant && t.tenant !== filter.tenant) continue
+        await bury(personId, id)
         grants++
       }
       const n = await keys.revokeOwned(personId, { ...(filter.door ? { door: filter.door } : {}), ...(filter.tenant ? { tenant: filter.tenant } : {}) })
       return { grants, keys: n }
     },
-    api: helpers,
+    api() {
+      // The library's helpers, with the two that revoke going through the kit, so each grant gets its tombstone.
+      const h = helpers()
+      const revokeGrant = (grantId: string, userId: string) => bury(userId, grantId)
+      return new Proxy(h, {
+        get(target, key) {
+          if (key === 'revokeGrant') return revokeGrant
+          if (key === 'deleteClient') return deleteClient
+          const v = Reflect.get(target, key, target)
+          return typeof v === 'function' ? v.bind(target) : v
+        },
+      })
+    },
   }
 }
 

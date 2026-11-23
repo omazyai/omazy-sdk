@@ -1,6 +1,6 @@
 {
   "name": "@omazyai/sdk",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Client for the Omazy Core API and its MCP server: models, knowledge, your agent, speech and calls from your own backend.",
   "keywords": [
     "omazy",

@@ -43,6 +43,22 @@ describe('oauth/keys entry', () => {
     expect(out.cap).toBe('R2')
   })
 
+  test('takes a refresh store from the same entry: a revoked key stays revoked', () => {
+    const r = run(`
+      import { Keys, memoryKv, kvRefreshStore } from './src/oauth/keys.ts'
+      const kv = memoryKv()
+      const keys = new Keys(kv, ['org'], { personal: { prefix: () => 'acme_mcp_org_' } }, [], kvRefreshStore(kv))
+      const { key, info } = await keys.createPersonal({ principal: { kind: 'staff', id: 'rina' }, seat: { id: 's', door: 'org', tenant: 't1' }, name: 'k' })
+      const before = !!(await keys.resolve(key, 'org'))
+      await keys.revoke('rina', info.id)
+      const after = !!(await keys.resolve(key, 'org'))
+      process.stdout.write(JSON.stringify({ before, after }))
+    `)
+    expect(r.err).toBe('')
+    expect(r.code).toBe(0)
+    expect(JSON.parse(r.out)).toEqual({ before: true, after: false })
+  })
+
   test('control: the full oauth entry needs the provider', () => {
     const r = run(`import './src/oauth/index.ts'`)
     expect(r.code).not.toBe(0)

@@ -5,7 +5,7 @@ Python client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/
 ## Install
 
 ```sh
-pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.0/omazy-0.5.0-py3-none-any.whl
+pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.1/omazy-0.5.1-py3-none-any.whl
 ```
 
 ## Use

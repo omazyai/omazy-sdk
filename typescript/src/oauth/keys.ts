@@ -6,14 +6,38 @@
 // Its own entry, `@omazyai/sdk/oauth/keys`: it loads neither the OAuth
 // provider nor `cloudflare:workers`, so a Node script or a plain test can mint
 // a key. `@omazyai/sdk/oauth` re-exports it.
+//
+// Revocation. A key record lives in KV, and each location reads KV through a
+// cache for up to about 60 seconds, so a key deleted in one location still
+// resolves in another for that long, and `transferService` there can write it
+// back. KV's listing lags by about as long, so a key minted a moment ago can
+// be missing from `list` and `revokeOwned`. Given a consistent store (the
+// refresh store's Durable Object or D1), a revoked key gets a tombstone there,
+// checked by `resolve`, `list` and `transferService`, every key is entered in
+// its owner's index there when it is minted, and `resolve` refuses a key made
+// before a revocation of its owner (`personLostRole`). Without a store the
+// keys work as before, with that window.
 
 import type { Principal, Seat } from '../capabilities/capability.js'
 import { isTier, type Tier, tierRank } from '../capabilities/tiers.js'
 import { b64url, sha256Hex } from '../guard/crypto.js'
 import type { SeatGrant } from '../mcp/server.js'
-import { KV_MIN_TTL, KV_PREFIX, type KvLike, listAll, SAFE_ID } from './kv.js'
+import { KV_MIN_TTL, KV_PREFIX, type KvLike, listAll, SAFE_ID, wholeNumber } from './kv.js'
+import { type KeyStore, keyTombstone, personIndex, revocationCovers } from './refresh.js'
 
 export { type KvLike, type KvListResult, type KvPutOptions, memoryKv } from './kv.js'
+export {
+  applyOAuthD1Migrations,
+  d1RefreshStore,
+  durableObjectRefreshStore,
+  type IndexEntry,
+  type KeyStore,
+  kvRefreshStore,
+  OAUTH_D1_MIGRATIONS,
+  OAuthRefreshLock,
+  type PersonRevocation,
+  type RefreshStore,
+} from './refresh.js'
 
 export const PERSONAL_MAX_DAYS = 90
 export const SERVICE_MAX_DAYS = 365
@@ -69,6 +93,8 @@ export interface KeyInfo {
 interface KeyRecord extends KeyInfo {
   principal: Principal
   seat: Seat
+  /** When the current owner took a moved service key. A revocation of the owner covers the key only if it came after. */
+  ownedSince?: number
 }
 
 const DAY = 86_400_000
@@ -120,6 +146,14 @@ export class Keys<D extends string> {
     private readonly opts: KeyOptions<D>,
     /** Doors whose seats have no tenant. Service keys are refused there unless `service.platformDoors` lists the door. */
     private readonly platformDoors: readonly D[] = [],
+    /**
+     * A consistent store (the refresh store's Durable Object or D1) for key
+     * tombstones, the owner index and person revocations. Optional: without
+     * one a revoked key keeps resolving for about 60 seconds in a location
+     * whose KV cache holds it, and a key minted in the last minute may be
+     * missing from `list` and `revokeOwned`.
+     */
+    private readonly revocations?: KeyStore,
   ) {
     // A misspelt tier would rank above R4 and cap nothing, so it throws.
     for (const [kind, t] of [
@@ -130,10 +164,10 @@ export class Keys<D extends string> {
     if (opts.service?.maxTier !== undefined && tierRank(opts.service.maxTier) > tierRank(SERVICE_TIER_CAP) && opts.service.allowR4 !== true)
       throw new Error(`oauth: service key maxTier ${opts.service.maxTier} is above ${SERVICE_TIER_CAP}; set keys.service.allowR4 to accept that`)
     for (const d of opts.service?.platformDoors ?? []) if (!platformDoors.includes(d)) throw new Error(`oauth: service.platformDoors names ${d}, which is not a platform door`)
-    this.personalMax = Math.min(opts.personal?.maxDays ?? PERSONAL_MAX_DAYS, PERSONAL_MAX_DAYS)
+    this.personalMax = Math.min(wholeNumber('keys.personal.maxDays', opts.personal?.maxDays) ?? PERSONAL_MAX_DAYS, PERSONAL_MAX_DAYS)
     const tier = opts.personal?.maxTier ?? PERSONAL_TIER_CAP
     this.personalTier = tierRank(tier) > tierRank(PERSONAL_TIER_CAP) ? PERSONAL_TIER_CAP : tier
-    this.serviceMax = Math.min(opts.service?.maxDays ?? SERVICE_MAX_DAYS, SERVICE_MAX_DAYS)
+    this.serviceMax = Math.min(wholeNumber('keys.service.maxDays', opts.service?.maxDays) ?? SERVICE_MAX_DAYS, SERVICE_MAX_DAYS)
     this.serviceTier = opts.service?.maxTier ?? SERVICE_DEFAULT_TIER
     const prefixes = new Set<string>()
     for (const d of doors) {
@@ -157,6 +191,8 @@ export class Keys<D extends string> {
     const hash = await sha256Hex(secret)
     const record: KeyRecord = { ...rec, id }
     const expiration = Math.floor(record.expiresAt / 1000) + KV_MIN_TTL
+    // Indexed first: a key that is in KV is in its owner's index, so a revocation finds it at once.
+    await this.indexKey(record, hash)
     await this.kv.put(recordKey(hash), JSON.stringify(record), { expiration })
     await this.kv.put(ownerIndex(record.owner, id), hash, { expiration })
     if (record.kind === 'service' && record.tenant) await this.kv.put(tenantIndex(record.tenant, id), hash, { expiration })
@@ -244,6 +280,18 @@ export class Keys<D extends string> {
     return this.prefixes.some((p) => id.startsWith(p))
   }
 
+  private async indexKey(rec: KeyRecord, hash: string): Promise<void> {
+    if (!this.revocations) return
+    await this.revocations.indexPut(personIndex(rec.owner), { kind: 'key', id: rec.id, ref: hash, door: rec.door, tenant: rec.tenant, until: rec.expiresAt + KV_MIN_TTL * 1000 })
+  }
+
+  /** Whether the store says this key is revoked: a tombstone, or a revocation of its owner made after the owner took it. */
+  private async revoked(rec: KeyRecord): Promise<boolean> {
+    if (!this.revocations) return false
+    const [grave, marks] = await Promise.all([this.revocations.tombstoned(keyTombstone(rec.id)), this.revocations.personRevocations(rec.owner)])
+    return !!grave || revocationCovers(marks, { door: rec.door, tenant: rec.tenant, at: rec.ownedSince ?? rec.createdAt })
+  }
+
   /** Finds the seat a key holds at this door, or null when it is unknown, expired, revoked or for another door. */
   async resolve(token: string, door: D): Promise<{ grant: SeatGrant; info: KeyInfo } | null> {
     if (!this.isKey(token, door) || token.length > 200) return null
@@ -251,6 +299,7 @@ export class Keys<D extends string> {
     if (!rec || rec.door !== door || rec.expiresAt <= Date.now()) return null
     const expected = rec.kind === 'personal' ? this.opts.personal?.prefix(door) : this.opts.service?.prefix(door)
     if (!expected || !token.startsWith(expected)) return null
+    if (await this.revoked(rec)) return null
     let maxTier = rec.maxTier
     // A key never reaches past today's cap for its kind, even one minted under a looser setting.
     const cap = rec.kind === 'personal' ? this.personalTier : this.serviceTier
@@ -279,58 +328,92 @@ export class Keys<D extends string> {
     return v ? Number(v) : null
   }
 
-  /** Every live key a person owns. */
-  async list(owner: string): Promise<(KeyInfo & { lastUsedAt: number | null })[]> {
-    const out: (KeyInfo & { lastUsedAt: number | null })[] = []
-    for (const k of await listAll(this.kv, ownerIndex(owner))) {
-      const rec = await this.recordAt(k.name)
-      if (rec && rec.owner === owner) out.push({ ...infoOf(rec), lastUsedAt: await this.lastUse(rec.id) })
+  /**
+   * The keys under a person's KV index and, with a store, their index there,
+   * which also holds a key minted a moment ago that KV's listing misses.
+   */
+  private async owned(owner: string): Promise<(KeyRecord & { hash: string })[]> {
+    const [listed, entries] = await Promise.all([
+      listAll(this.kv, ownerIndex(owner)),
+      this.revocations ? this.revocations.indexList(personIndex(owner)) : Promise.resolve([]),
+    ])
+    const seen = new Set<string>()
+    const out: (KeyRecord & { hash: string })[] = []
+    const add = (rec: (KeyRecord & { hash: string }) | null) => {
+      if (rec && rec.owner === owner && !seen.has(rec.id)) {
+        seen.add(rec.id)
+        out.push(rec)
+      }
     }
+    for (const rec of await Promise.all(listed.map((k) => this.recordAt(k.name)))) add(rec)
+    const missing = entries.filter((e) => e.kind === 'key' && e.ref && !seen.has(e.id))
+    for (const rec of await Promise.all(missing.map((e) => this.recordByHash(e.ref!)))) add(rec)
     return out
   }
 
-  /** Every live service key of a tenant. */
+  /** Every live key a person owns. */
+  async list(owner: string): Promise<(KeyInfo & { lastUsedAt: number | null })[]> {
+    const recs = await this.owned(owner)
+    const gone = await Promise.all(recs.map((r) => this.revoked(r)))
+    const live = recs.filter((_, i) => !gone[i])
+    return Promise.all(live.map(async (rec) => ({ ...infoOf(rec), lastUsedAt: await this.lastUse(rec.id) })))
+  }
+
+  /** Every live service key of a tenant. Its index is a KV listing, so a key minted in the last minute may be missing. */
   async listService(tenant: string): Promise<(KeyInfo & { lastUsedAt: number | null })[]> {
     const out: (KeyInfo & { lastUsedAt: number | null })[] = []
     for (const k of await listAll(this.kv, tenantIndex(tenant))) {
       const rec = await this.recordAt(k.name)
-      if (rec && rec.tenant === tenant) out.push({ ...infoOf(rec), lastUsedAt: await this.lastUse(rec.id) })
+      if (rec && rec.tenant === tenant && !(await this.revoked(rec))) out.push({ ...infoOf(rec), lastUsedAt: await this.lastUse(rec.id) })
     }
     return out
   }
 
   private async recordAt(indexKey: string): Promise<(KeyRecord & { hash: string }) | null> {
     const hash = await this.kv.get(indexKey)
-    if (!hash) return null
+    return hash ? this.recordByHash(hash) : null
+  }
+
+  private async recordByHash(hash: string): Promise<(KeyRecord & { hash: string }) | null> {
     const rec = (await this.kv.get(recordKey(hash), { type: 'json' })) as KeyRecord | null
     if (!rec || rec.expiresAt <= Date.now()) return null
     return { ...rec, hash }
   }
 
+  /** One key the owner holds, through KV or, with a store, the owner's index there. */
+  private async ownedKey(owner: string, id: string): Promise<(KeyRecord & { hash: string }) | null> {
+    const rec = await this.recordAt(ownerIndex(owner, id))
+    if (rec) return rec
+    if (!this.revocations) return null
+    const e = (await this.revocations.indexList(personIndex(owner))).find((x) => x.kind === 'key' && x.id === id && x.ref)
+    return e ? this.recordByHash(e.ref!) : null
+  }
+
   /** Revokes one key the owner holds. Returns false when there is no such key. */
   async revoke(owner: string, id: string): Promise<boolean> {
-    const rec = await this.recordAt(ownerIndex(owner, id))
+    const rec = await this.ownedKey(owner, id)
     if (!rec || rec.owner !== owner) return false
     await this.drop(rec)
     return true
   }
 
+  /** Tombstone first, with a store: once it is written, no location resolves or moves the key, whatever its cache holds. */
   private async drop(rec: KeyRecord & { hash: string }): Promise<void> {
+    if (this.revocations) {
+      const ttl = Math.max(KV_MIN_TTL, Math.ceil((rec.expiresAt - Date.now()) / 1000) + 3600)
+      await this.revocations.tombstone(keyTombstone(rec.id), { userId: rec.owner, grantId: rec.id }, ttl)
+    }
     await this.kv.delete(recordKey(rec.hash))
     await this.kv.delete(ownerIndex(rec.owner, rec.id))
     if (rec.tenant) await this.kv.delete(tenantIndex(rec.tenant, rec.id))
     await this.kv.delete(lastUseKey(rec.id))
+    await this.revocations?.indexDelete(personIndex(rec.owner), rec.id).catch(() => undefined)
   }
 
   /** Revokes the keys a person owns, optionally only at one door or tenant. Returns how many. */
   async revokeOwned(owner: string, filter: { door?: string; tenant?: string; kind?: KeyKind } = {}): Promise<number> {
     let n = 0
-    for (const k of await listAll(this.kv, ownerIndex(owner))) {
-      const rec = await this.recordAt(k.name)
-      if (!rec) {
-        await this.kv.delete(k.name)
-        continue
-      }
+    for (const rec of await this.owned(owner)) {
       if (filter.door && rec.door !== filter.door) continue
       if (filter.tenant && rec.tenant !== filter.tenant) continue
       if (filter.kind && rec.kind !== filter.kind) continue
@@ -343,18 +426,23 @@ export class Keys<D extends string> {
   /**
    * Moves a service key to another owner in the same tenant, when an owner
    * leaves and another re-confirms the key. The product checks the new owner
-   * may hold it.
+   * may hold it. False for a key that is unknown, not a service key, not the
+   * owner's or, with a store, revoked: a location whose KV cache still holds
+   * a revoked key would otherwise write it back.
    */
   async transferService(fromOwner: string, id: string, to: Principal): Promise<boolean> {
     if (!SAFE_ID.test(to.id)) throw new Error('oauth: the owner id has characters a key cannot carry')
-    const rec = await this.recordAt(ownerIndex(fromOwner, id))
+    const rec = await this.ownedKey(fromOwner, id)
     if (!rec || rec.kind !== 'service' || rec.owner !== fromOwner) return false
+    if (await this.revoked(rec)) return false
     const { hash, ...plain } = rec
-    const next: KeyRecord = { ...plain, owner: to.id }
+    const next: KeyRecord = { ...plain, owner: to.id, ownedSince: Date.now() }
     const expiration = Math.floor(next.expiresAt / 1000) + KV_MIN_TTL
+    await this.indexKey(next, hash)
     await this.kv.put(recordKey(hash), JSON.stringify(next), { expiration })
     await this.kv.put(ownerIndex(to.id, id), hash, { expiration })
     await this.kv.delete(ownerIndex(fromOwner, id))
+    await this.revocations?.indexDelete(personIndex(fromOwner), id).catch(() => undefined)
     return true
   }
 }

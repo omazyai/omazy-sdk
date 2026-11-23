@@ -31,7 +31,7 @@ const (
 	// DefaultBaseURL is the production Core API.
 	DefaultBaseURL = "https://mw.omazy.ai/api/v1/core"
 	// Version of this client.
-	Version = "0.5.0"
+	Version = "0.5.1"
 )
 
 // Error is a refusal or failure from the Core API. Branch on Code, log Message.

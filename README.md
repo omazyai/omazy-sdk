@@ -29,19 +29,19 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.0/omazyai-sdk-0.5.0.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.1/omazyai-sdk-0.5.1.tgz
 ```
 
 **Python.**
 
 ```sh
-pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.0/omazy-0.5.0-py3-none-any.whl
+pip install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.1/omazy-0.5.1-py3-none-any.whl
 ```
 
 **Go.**
 
 ```sh
-go get github.com/omazyai/omazy-sdk/go@v0.5.0
+go get github.com/omazyai/omazy-sdk/go@v0.5.1
 ```
 
 ## Your account and your token

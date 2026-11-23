@@ -130,3 +130,15 @@ export async function peek(kv: KvLike, bucket: string, id: string, windowSeconds
   const window = Math.floor(Date.now() / 1000 / windowSeconds)
   return Number((await kv.get(`${KV_PREFIX}rl:${bucket}:${id}:${window}`)) ?? 0)
 }
+
+/**
+ * A numeric option: a whole number from `min` (default 1) up, or undefined
+ * when it was left out. NaN, Infinity, a fraction, a string or anything below
+ * `min` throws at start: a comparison with NaN is always false, so it would
+ * pass every check and lift the limit it sets.
+ */
+export function wholeNumber(name: string, value: unknown, min = 1): number | undefined {
+  if (value === undefined) return undefined
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min) throw new Error(`oauth: ${name} must be a whole number of at least ${min}`)
+  return value
+}

@@ -8,10 +8,16 @@
 // codes and must bind them to the state the same way; this helper is for a
 // product whose sign-in can reach the same KV namespace (or wraps it in an
 // endpoint).
+//
+// KV cannot make a redeem single use across locations: one location deletes
+// the code while another still reads it from its cache. Given the refresh
+// store (`store`), a redeem also claims the code there, under a lock, and a
+// code claimed once is refused everywhere.
 
 import type { Principal } from '../capabilities/capability.js'
 import { b64url, sha256Hex } from '../guard/crypto.js'
-import { KV_MIN_TTL, KV_PREFIX, type KvLike } from './kv.js'
+import { KV_MIN_TTL, KV_PREFIX, type KvLike, wholeNumber } from './kv.js'
+import type { RefreshStore } from './refresh.js'
 
 export interface SignInCodes {
   /**
@@ -35,9 +41,30 @@ interface CodeRecord {
 
 const okState = (s: unknown): s is string => typeof s === 'string' && s.length > 0 && s.length <= 512
 
-export function signInCodes(kv: KvLike, opts: { ttlSeconds?: number } = {}): SignInCodes {
-  const ttl = Math.max(KV_MIN_TTL, opts.ttlSeconds ?? 120)
+/**
+ * `ttlSeconds` (a whole number, at least 60, default 120). `store`: the
+ * refresh store the authorization server uses; with a consistent one
+ * (`durableObjectRefreshStore`, `d1RefreshStore`) a code is single use across
+ * locations.
+ */
+export function signInCodes(kv: KvLike, opts: { ttlSeconds?: number; store?: Pick<RefreshStore, 'lock' | 'unlock' | 'retire' | 'retired'> } = {}): SignInCodes {
+  const ttl = Math.max(KV_MIN_TTL, wholeNumber('signInCodes ttlSeconds', opts.ttlSeconds) ?? 120)
+  const store = opts.store
   const key = async (code: string) => `${KV_PREFIX}signin:${await sha256Hex(code)}`
+  /** True for the first redeem of a code, anywhere. A redeem racing another is refused, and the code is spent. */
+  const claim = async (hash: string): Promise<boolean> => {
+    if (!store) return true
+    const name = `signin:${hash}`
+    const holder = await store.lock(name, 30_000)
+    if (!holder) return false
+    try {
+      if (await store.retired(name, hash)) return false
+      await store.retire(name, hash, { userId: 'signin', grantId: name }, ttl)
+      return true
+    } finally {
+      await store.unlock(name, holder).catch(() => undefined)
+    }
+  }
   return {
     async issue(person, bind) {
       if (!okState(bind?.state)) throw new Error('oauth: a sign-in code is issued for the state the sign-in page was opened with')
@@ -48,12 +75,17 @@ export function signInCodes(kv: KvLike, opts: { ttlSeconds?: number } = {}): Sig
     },
     async redeem(code, state) {
       if (typeof code !== 'string' || code.length < 20 || code.length > 100 || !okState(state)) return null
-      const k = await key(code)
+      const hash = await sha256Hex(code)
+      const k = `${KV_PREFIX}signin:${hash}`
+      // KV first, so a made-up code costs no write to the store.
       const rec = (await kv.get(k, { type: 'json' })) as CodeRecord | null
       if (!rec) return null
-      // KV cannot make get-then-delete atomic. A racing second use would also
-      // need this flow's state, which is bound to one browser by its cookie.
+      // Without a store, KV cannot make get-then-delete atomic: a second use
+      // from a location whose cache still holds the code would also need this
+      // flow's state, which is bound to one browser by its cookie.
+      const first = await claim(hash)
       await kv.delete(k)
+      if (!first) return null
       if (rec.expiresAt <= Date.now() || typeof rec.state !== 'string') return null
       return rec.state === (await sha256Hex(state)) ? rec.person : null
     },
