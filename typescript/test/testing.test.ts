@@ -268,6 +268,23 @@ describe('fakeCore', () => {
     fake.reset()
     expect(fake.calls.length).toBe(0)
   })
+
+  test('on() without times answers every later turn, so a second rule for the unit never fires; times: 1 answers one', async () => {
+    const say = async (fake: ReturnType<typeof fakeCore>) => {
+      const scope = await world(fake).ai.start(ctx, helper)
+      const out: (string | undefined)[] = []
+      for (const m of ['one', 'two', 'three']) out.push((await scope.complete({ messages: [{ role: 'user', content: m }] })).text)
+      return out
+    }
+    const sticky = fakeCore({ fallback: reply.text('fallback') })
+    sticky.on('org_helper', reply.text('first'))
+    sticky.on('org_helper', reply.text('second'))
+    expect(await say(sticky)).toEqual(['first', 'first', 'first'])
+    const once = fakeCore({ fallback: reply.text('fallback') })
+    once.on('org_helper', reply.text('first'), { times: 1 })
+    once.on('org_helper', reply.text('second'), { times: 1 })
+    expect(await say(once)).toEqual(['first', 'second', 'fallback'])
+  })
 })
 
 // ---------------------------------------------------------------- golden sets

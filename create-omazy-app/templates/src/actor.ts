@@ -22,9 +22,10 @@ export const noteIntake = actor<AppCtx>({
 })
 
 /**
- * actor_start, actor_reply and actor_status on the MCP door. They are R1 and
- * never submit: at the card they name the note_add call, which the client
- * makes on the same door, so the guard still asks the person.
+ * actor_start, actor_reply, actor_status and actor_confirm on the MCP door.
+ * The first three are R1 and never submit. At the card they name the
+ * actor_confirm call, which is R2: the guard asks the person before it runs
+ * note_add, and actor_status then reads the outcome.
  */
 export const intakeTools = actorTools<AppCtx, Permission, Door>(() => live.actors(), {
   audiences: ['app'],

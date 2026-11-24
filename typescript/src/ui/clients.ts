@@ -8,6 +8,7 @@ import type {
   ApprovalItem,
   ApprovalStatusName,
   CardOutcomeData,
+  CodeSent,
   ConsentCardData,
   DecideBody,
   DecideResult,
@@ -83,6 +84,8 @@ export interface UiClient {
     list(q?: { status?: ApprovalStatusName | 'all' }): Promise<ApprovalItem[]>
     get(id: string): Promise<ApprovalItem | null>
     decide(id: string, body: DecideBody): Promise<DecideResult>
+    /** Sends the decider a step-up code for this approval. Needs `uiRoutes` with `approvals.codes`. */
+    sendCode(id: string): Promise<CodeSent>
   }
   apps: {
     list(): Promise<AppsData>
@@ -111,6 +114,7 @@ export function uiClient(o: Partial<HttpOptions> = {}): UiClient {
       get: async (id) => (await call<{ approval: ApprovalItem | null }>('GET', `/approvals/${seg(id)}`, undefined, [404])).approval ?? null,
       // Every decide outcome is an answer the inbox shows, whatever its status.
       decide: (id, body) => call('POST', `/approvals/${seg(id)}/decide`, body, [400, 403, 404, 409]),
+      sendCode: (id) => call('POST', `/approvals/${seg(id)}/code`, {}),
     },
     apps: {
       list: () => call('GET', '/apps'),

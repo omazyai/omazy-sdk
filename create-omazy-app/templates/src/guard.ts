@@ -4,7 +4,7 @@
 // R3 and R4 for an approval, and writes the request log. See the guard kit page.
 
 import type { AnyCapability } from '@omazyai/sdk/capabilities'
-import { createGuard, type Guard, type GuardStore, type RequestLogSink, type SwitchStore } from '@omazyai/sdk/guard'
+import { createGuard, type Guard, type GuardStore, type RequestLogSink, type StepUpVerifier, type SwitchStore } from '@omazyai/sdk/guard'
 import { can, rolesOf } from './access'
 import { NOTE_FIELDS, reg } from './capabilities'
 import { live } from './live'
@@ -21,6 +21,8 @@ export interface GuardParts {
    * deploy answers nothing until you decide it should. "on" in `wrangler dev`.
    */
   doorDefault: 'on' | 'off'
+  /** Proves who decides an approval: the app's code step-up. */
+  stepUp?: readonly StepUpVerifier<AppCtx>[]
   onApproval?: Parameters<typeof createGuard<AppCtx, Permission>>[0]['onApproval']
   waitUntil?: (p: Promise<unknown>) => void
 }
@@ -49,7 +51,10 @@ export function buildGuard(p: GuardParts): Guard<AppCtx> {
       }
       return tenants
     },
+    // Name a policy here for each R3 capability's `approval`, such as
+    // policies.single({ approver: approver.role('owner'), stepUp: 'code', expires: '24h' }).
     policies: {},
+    ...(p.stepUp ? { stepUp: p.stepUp } : {}),
     ...(p.onApproval ? { onApproval: p.onApproval } : {}),
     ...(p.waitUntil ? { waitUntil: p.waitUntil } : {}),
   })

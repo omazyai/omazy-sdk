@@ -332,6 +332,36 @@ describe('ui: uiRoutes and uiClient over the kits', () => {
     expect((await owner.approvals.list({ status: 'all' })).map((a) => a.status)).toEqual(['executed'])
   })
 
+  test('approvals: the decider asks for a step-up code, then approves with it; nobody else can ask', async () => {
+    const k = kit({ codes: true })
+    await k.guard.call(ctxOf('rina', 'copilot'), 'note_share', { id: 7 })
+    const owner = k.clientFor(ctxOf('owner'))
+    const [item] = await owner.approvals.list()
+    expect(item!.needs.stepUp).toEqual(['code'])
+    // The requester sees the request but may not decide it, so no code goes to her; a stranger finds nothing.
+    await expect(k.clientFor(ctxOf('rina')).approvals.sendCode(item!.id)).rejects.toMatchObject({ status: 403 })
+    await expect(k.clientFor(ctxOf('karim')).approvals.sendCode(item!.id)).rejects.toMatchObject({ status: 404 })
+    expect(k.sent).toEqual([])
+    const sent = await owner.approvals.sendCode(item!.id)
+    expect(sent).toMatchObject({ channels: ['email'], method: 'code' })
+    expect(Date.parse(sent.expiresAt)).toBeGreaterThan(Date.now())
+    expect(k.sent).toEqual([{ person: 'owner', channel: 'email', code: expect.stringMatching(/^\d{6}$/), approval: item!.id }])
+    const wrong = k.sent[0]!.code === '000000' ? '111111' : '000000'
+    expect(await owner.approvals.decide(item!.id, { approve: true, proof: { method: 'code', codes: { email: wrong } } })).toMatchObject({ outcome: 'step_up_failed' })
+    const ok = await owner.approvals.decide(item!.id, { approve: true, proof: { method: sent.method, codes: { email: k.sent[0]!.code } } })
+    expect(ok).toMatchObject({ outcome: 'approved', approval: { status: 'executed', verification: 'code' } })
+    // Decided: no more codes for it.
+    await expect(owner.approvals.sendCode(item!.id)).rejects.toMatchObject({ status: 409 })
+  })
+
+  test('approvals: without codes the code route is not served', async () => {
+    const k = kit()
+    await k.guard.call(ctxOf('rina', 'copilot'), 'note_share', { id: 7 })
+    const [item] = await k.clientFor(ctxOf('owner')).approvals.list()
+    const req = new Request(`https://app.example/ui/approvals/${item!.id}/code`, { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } })
+    expect(await k.routes.handle(req, ctxOf('owner'))).toBeNull()
+  })
+
   test('a POST that is not JSON is refused; an unknown path falls through', async () => {
     const k = kit()
     const res = await k.routes.handle(new Request('https://app.example/ui/grants', { method: 'POST', body: 'capability=note_add', headers: { 'content-type': 'application/x-www-form-urlencoded' } }), ctxOf('rina'))

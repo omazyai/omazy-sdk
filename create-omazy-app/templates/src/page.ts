@@ -5,7 +5,7 @@
 // sessionStorage and sent as a bearer token. Put your own sign-in here when
 // the product has one.
 
-import { ApprovalsInbox, CopilotPanel, StandingGrants, UiProvider } from '@omazyai/sdk/ui/react'
+import { ApprovalsInbox, CodeStepUpForm, CopilotPanel, StandingGrants, UiProvider } from '@omazyai/sdk/ui/react'
 import { createElement as h, type ReactNode, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 
@@ -66,7 +66,8 @@ function Page(): ReactNode {
       h('h1', null, '%%title%%'),
       h(CopilotPanel, { thread, screen: { name: 'notes' } }),
       h(StandingGrants, {}),
-      h(ApprovalsInbox, {}),
+      // An approval that asks for a code: send it, type it, approve.
+      h(ApprovalsInbox, { stepUp: (s) => h(CodeStepUpForm, s) }),
     ),
   )
 }

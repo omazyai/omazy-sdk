@@ -68,6 +68,15 @@ export interface UiText {
   typedTargetMismatch: string
   stepUpTitle: string
   stepUpMissing: string
+  /** CodeStepUpForm: the button that sends the code. */
+  codeSend: string
+  /** CodeStepUpForm: where the code went, such as `email` or `email and sms`. */
+  codeSent: (channels: string) => string
+  /** CodeStepUpForm: the field's label; with two channels, one field each. */
+  codeLabel: (channel: string | null) => string
+  codeResend: string
+  codeSubmit: string
+  codeRequired: string
   cannotDecide: string
   decideOutcome: Record<'approved' | 'refused' | 'expired' | 'already_decided' | 'not_found' | 'step_up_required' | 'step_up_failed', string>
   ranOk: string
@@ -201,6 +210,12 @@ const en: UiText = {
   typedTargetMismatch: 'That does not match the target.',
   stepUpTitle: 'Verify it is you',
   stepUpMissing: 'This approval needs a verification step that this page does not offer.',
+  codeSend: 'Send me a code',
+  codeSent: (channels) => `We sent a code to your ${channels}. Type it here to approve.`,
+  codeLabel: (channel) => (channel ? `Code sent to your ${channel}` : 'Code'),
+  codeResend: 'Send a new code',
+  codeSubmit: 'Approve with this code',
+  codeRequired: 'Type the code you received.',
   cannotDecide: 'You cannot decide this request.',
   decideOutcome: {
     approved: 'Approved.',
@@ -347,6 +362,12 @@ const bn: UiText = {
   typedTargetMismatch: 'এটি লক্ষ্যের সঙ্গে মেলে না।',
   stepUpTitle: 'যাচাই করুন যে এটি আপনি',
   stepUpMissing: 'এই অনুমোদনের জন্য যে যাচাই দরকার, এই পাতায় তা নেই।',
+  codeSend: 'আমাকে একটি কোড পাঠান',
+  codeSent: (channels) => `আপনার ${channels}-এ একটি কোড পাঠানো হয়েছে। অনুমোদন দিতে কোডটি এখানে লিখুন।`,
+  codeLabel: (channel) => (channel ? `আপনার ${channel}-এ পাঠানো কোড` : 'কোড'),
+  codeResend: 'নতুন কোড পাঠান',
+  codeSubmit: 'এই কোড দিয়ে অনুমোদন দিন',
+  codeRequired: 'যে কোডটি পেয়েছেন, সেটি লিখুন।',
   cannotDecide: 'এই অনুরোধে আপনি সিদ্ধান্ত নিতে পারবেন না।',
   decideOutcome: {
     approved: 'অনুমোদিত।',

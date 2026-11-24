@@ -1,16 +1,26 @@
 #!/usr/bin/env node
-// Puts the product on your Cloudflare account, once: creates the D1 database
-// and the KV namespace and writes their ids into wrangler.jsonc, applies the
-// migrations, deploys, and sets GUARD_SECRET. Run it again safely: what exists
-// is kept.
+// Puts the product on your Cloudflare account, once: builds the page, creates
+// the D1 database and the KV namespace and writes their ids into
+// wrangler.jsonc, applies the migrations, deploys, and sets GUARD_SECRET. Run
+// it again safely: what exists is kept.
 //
 //   npm run setup
 
+import { execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fail, wrangler } from './wrangler.mjs'
 
 const CONFIG = new URL('../wrangler.jsonc', import.meta.url)
+
+// The page first, so the deploy below ships the current one and a build
+// error stops setup before anything is made on Cloudflare.
+const scripts = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).scripts ?? {}
+if (scripts['build:page']) {
+  console.log('building the page')
+  execFileSync('npm', ['run', '--silent', 'build:page'], { stdio: 'inherit' })
+}
+
 let text = readFileSync(CONFIG, 'utf8')
 const name = text.match(/"name": "([^"]+)"/)?.[1] ?? fail('wrangler.jsonc has no name')
 

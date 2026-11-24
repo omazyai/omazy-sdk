@@ -280,6 +280,32 @@ describe('ui react: settings screens', () => {
     expect(el.querySelector('.omz-inbox__detail')).toBeNull()
   })
 
+  test('approvals inbox with CodeStepUpForm: send a code, an empty field is refused, the code approves', async () => {
+    const k = kit({ codes: true })
+    await k.guard.call(ctxOf('rina', 'copilot'), 'note_share', { id: 1 })
+    const el = await dom.render(
+      h(ui.UiProvider, { fetch: k.fetchFor(ctxOf('owner')) }, h(ui.ApprovalsInbox, { pollMs: 0, stepUp: (s: Parameters<typeof ui.CodeStepUpForm>[0]) => h(ui.CodeStepUpForm, s) })),
+    )
+    await dom.click(el.querySelector('button[data-omz-item]'))
+    const detail = el.querySelector('.omz-inbox__detail')!
+    await dom.click(byText(detail, 'button', 'Approve'))
+    expect(k.sent).toEqual([])
+    await dom.click(byText(detail, 'button', 'Send me a code'))
+    await dom.flush()
+    expect(k.sent).toHaveLength(1)
+    expect(detail.textContent).toContain('We sent a code to your email.')
+    const input = detail.querySelector<HTMLInputElement>('.omz-stepup input')!
+    expect(input.getAttribute('autocomplete')).toBe('one-time-code')
+    expect(document.activeElement).toBe(input)
+    await dom.click(byText(detail, 'form button', 'Approve with this code'))
+    expect(detail.querySelector('[role="alert"]')?.textContent).toBe('Type the code you received.')
+    await dom.type(input, k.sent[0]!.code)
+    await dom.click(byText(detail, 'form button', 'Approve with this code'))
+    await dom.flush()
+    expect(detail.textContent).toContain('Approved. It ran.')
+    expect(el.querySelector('.omz-badge[data-status="executed"]')?.textContent).toBe('Done')
+  })
+
   test('approvals inbox: someone who cannot decide sees why, and no buttons', async () => {
     const k = kit()
     await k.guard.call(ctxOf('rina', 'copilot'), 'note_share', { id: 1 })

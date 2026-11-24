@@ -17,6 +17,8 @@ export interface Env {
   GUARD_SECRET: string
   /** "off" (production) keeps the MCP door off until a switch turns it on. */
   DOOR_DEFAULT?: string
+  /** "1" in .dev.vars only: approval codes go to the console. Never set in production. */
+  STEP_UP_LOG?: string
 //#if ai
   /** A Core API token for the model calls. */
   OMAZY_TOKEN?: string

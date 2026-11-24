@@ -76,9 +76,9 @@ export interface CopilotOptions<C extends BaseCtx> {
    * Actors the model may hand the conversation to. The person's messages then
    * go to the actor until it closes. Default: the actors behind any
    * `actorTools` in the registry, so one registry serves an actor over MCP
-   * and in the copilot. The registry's actor_start, actor_reply and
-   * actor_status are never shown to the copilot's model; it hands off with
-   * its own actor_start.
+   * and in the copilot. The registry's actor_start, actor_reply,
+   * actor_status and actor_confirm are never shown to the copilot's model; it
+   * hands off with its own actor_start.
    */
   actors?: { runtime: ActorRuntime<C> | (() => ActorRuntime<C>); ids?: readonly string[] }
   /** The prompt language for this person. Default the unit's first. */

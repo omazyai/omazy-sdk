@@ -24,7 +24,7 @@ import {
   slot,
 } from '../src/actors/index'
 import { createAi, memoryRunStore, promptTemplates } from '../src/ai/index'
-import { type BaseCtx, type Capability, capability, registry, schema } from '../src/capabilities/index'
+import { assertAdditive, type BaseCtx, BreakingChangeError, type Capability, capability, registry, schema, snapshotOf } from '../src/capabilities/index'
 import { approver, createGuard, type D1DatabaseLike, type D1PreparedStatementLike, memoryGuardStore, memoryRequestLog, policies } from '../src/guard/index'
 import { fakeCore as testingFakeCore, reply } from '../src/testing/index'
 
@@ -876,8 +876,9 @@ describe('surfaces', () => {
       script: [[it('tenant_id', 'Hemi Hossain'), it('amount', '29,900'), it('invoice_id', 'November')], [it('external_ref', 'DBBL-7731-20261121')]],
     })
     const tools = reg.mcpTools('platform').filter((t) => t.name.startsWith('actor_'))
-    expect(tools.map((t) => t.name)).toEqual(['actor_start', 'actor_reply', 'actor_status'])
-    expect(tools.every((t) => t.annotations.readOnlyHint === true)).toBe(true)
+    expect(tools.map((t) => t.name)).toEqual(['actor_start', 'actor_reply', 'actor_status', 'actor_confirm'])
+    // Three only read and write the draft; actor_confirm submits, so the guard asks the person first.
+    expect(tools.filter((t) => t.annotations.readOnlyHint === true).map((t) => t.name)).toEqual(['actor_start', 'actor_reply', 'actor_status'])
     const ctx = admin({ channel: 'mcp' })
     const s = await guard.call<any>(ctx, 'actor_start', { actor: 'payment_receipt', text: 'Hemi Hossain paid 29,900 for November' })
     expect(s.outcome).toBe('ok')
@@ -887,16 +888,71 @@ describe('surfaces', () => {
     expect(r.outcome).toBe('ok')
     const res = (r as { result: any }).result
     expect(res.state).toBe('confirm')
-    expect(res.submit.capability).toBe('payment_record_manual_bank')
+    expect(res.submit).toMatchObject({ capability: 'actor_confirm', arguments: { session: session.session, card: res.card.id } })
     expect(recorded).toHaveLength(0)
-    // The client calls the target itself on the same door: the guard holds it for approval.
-    const sub = await guard.call(ctx, res.submit.capability, res.submit.arguments)
-    expect(sub.outcome).toBe('pending_approval')
+    // The client submits on the same door: the guard asks the person, then the target waits for approval.
+    const ask = await guard.call(ctx, res.submit.capability, res.submit.arguments)
+    expect(ask.outcome).toBe('confirm_required')
+    expect(recorded).toHaveLength(0)
+    const sub = await guard.call<any>(ctx, res.submit.capability, res.submit.arguments, { confirmToken: (ask as { token: string }).token })
+    expect(sub.outcome).toBe('ok')
+    expect((sub as { result: any }).result.state).toBe('pending_approval')
     expect(recorded).toHaveLength(0)
     const st = await guard.call<any>(ctx, 'actor_status', { session: session.session })
-    expect((st as { result: any }).result.state).toBe('confirm')
+    expect((st as { result: any }).result.state).toBe('pending_approval')
     const missing = await guard.call<any>(ctx, 'actor_status', { session: 'act_nope' })
     expect((missing as { result: any }).result.refusal.code).toBe('not_found')
+  })
+
+  test('MCP: after the person confirms the card, actor_status reads done', async () => {
+    const { guard } = world({ withTools: true, script: [[it('name', 'Rina Akter'), it('role', 'host')]] })
+    const ctx = admin({ channel: 'mcp' })
+    const s = await guard.call<any>(ctx, 'actor_start', { actor: 'staff_onboard', text: 'Add Rina Akter as host' })
+    const card = (s as { result: any }).result
+    expect(card.state).toBe('confirm')
+    expect(card.submit.capability).toBe('actor_confirm')
+    const ask = await guard.call<any>(ctx, 'actor_confirm', card.submit.arguments)
+    expect(ask.outcome).toBe('confirm_required')
+    expect((ask as { preview: { summary: string } }).preview.summary).toBe(card.card.summary)
+    expect(staffAdded).toHaveLength(0)
+    const done = await guard.call<any>(ctx, 'actor_confirm', card.submit.arguments, { confirmToken: (ask as { token: string }).token })
+    expect((done as { result: any }).result.state).toBe('done')
+    expect(staffAdded).toHaveLength(1)
+    const st = await guard.call<any>(ctx, 'actor_status', { session: card.session })
+    expect((st as { result: any }).result.state).toBe('done')
+    // The card is spent: a second submit finds nothing to confirm and adds no one.
+    const again = await guard.call<any>(ctx, 'actor_confirm', card.submit.arguments)
+    expect(again.outcome).toBe('stale')
+    expect(staffAdded).toHaveLength(1)
+  })
+
+  test('MCP: a confirm given for a card that changed since is refused', async () => {
+    const { guard } = world({ withTools: true, script: [[it('name', 'Rina Akter'), it('role', 'host')], [it('role', 'manager', 0.95, 'message', 'manager')]] })
+    const ctx = admin({ channel: 'mcp' })
+    const card = ((await guard.call<any>(ctx, 'actor_start', { actor: 'staff_onboard', text: 'Add Rina Akter as host' })) as { result: any }).result
+    const ask = await guard.call<any>(ctx, 'actor_confirm', card.submit.arguments)
+    const moved = ((await guard.call<any>(ctx, 'actor_reply', { session: card.session, text: 'make her a manager' })) as { result: any }).result
+    expect(moved.state).toBe('confirm')
+    expect(moved.card.id).not.toBe(card.card.id)
+    const late = await guard.call<any>(ctx, 'actor_confirm', card.submit.arguments, { confirmToken: (ask as { token: string }).token })
+    expect(late.outcome).toBe('stale')
+    expect(staffAdded).toHaveLength(0)
+  })
+
+  test('adding an actor to the door is an additive catalog change; removing one is breaking', () => {
+    const rt = world().rt
+    const snap = (actors: string[]) => snapshotOf(actorTools<C, string, 'platform'>(rt, { audiences: ['platform'], permission: 'actors', actors }))
+    const one = snap(['payment_receipt'])
+    const two = snap(['payment_receipt', 'staff_onboard'])
+    expect(one.capabilities.find((c) => c.name === 'actor_start')!.version).toBe(1)
+    expect(two.capabilities.find((c) => c.name === 'actor_start')!.version).toBe(2)
+    const changes = assertAdditive(one, two)
+    expect(changes.map((c) => c.name)).toEqual(['actor_start'])
+    expect(changes.every((c) => !c.breaking)).toBe(true)
+    expect(() => assertAdditive(two, one)).toThrow(BreakingChangeError)
+    // Without a list, actor_start takes any id and stays at version 1.
+    const open = snapshotOf(actorTools<C, string, 'platform'>(rt, { audiences: ['platform'], permission: 'actors' }))
+    expect(open.capabilities.find((c) => c.name === 'actor_start')!.version).toBe(1)
   })
 
   test('copilot: the model opens the actor, then the person’s messages go to it by code', async () => {

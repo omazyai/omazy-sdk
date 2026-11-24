@@ -1,7 +1,8 @@
 // What the scaffolder writes, without installing anything.
 
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { kitMigrations } from '../scripts/kit-migrations'
@@ -99,6 +100,14 @@ describe('the full preset', () => {
     ])
   })
 
+  test('an owner can approve in the page: the inbox has the code step-up, and dev prints the code', () => {
+    expect(files['src/page.ts']).toContain('stepUp: (s) => h(CodeStepUpForm, s)')
+    expect(files['src/app.ts']).toContain('approvals: { guard, store: p.guardStore, codes }')
+    expect(files['.dev.vars']).toContain('STEP_UP_LOG=1')
+    // Only .dev.vars turns the console sender on; the deployed Worker never gets it.
+    expect(files['wrangler.jsonc']).not.toContain('STEP_UP_LOG')
+  })
+
   test('binds the Durable Objects, the Workflow, assets and rate limits the kits need', () => {
     const w = jsonc(files['wrangler.jsonc']!)
     expect(w.account_id).toBe(ACCOUNT)
@@ -109,6 +118,8 @@ describe('the full preset', () => {
     expect(w.ratelimits.map((r: { name: string }) => r.name)).toEqual(['AUTHORIZE_LIMIT', 'TOKEN_LIMIT'])
     expect(w.assets.binding).toBe('ASSETS')
     expect(w.vars.OAUTH).toBe('off')
+    // The client posts to <base>/ai/complete, so the base must end in /core.
+    expect(w.vars.OMAZY_BASE_URL).toBe('https://mw.omazy.ai/api/v1/core')
   })
 
   test('the AI unit carries its eval set and threshold', () => {
@@ -136,6 +147,52 @@ describe('every combination', () => {
 describe('migrations', () => {
   test('are the kits\' own SQL from this release (bun scripts/sync-migrations.ts)', () => {
     for (const [file, sql] of Object.entries(kitMigrations())) expect(readFileSync(join(import.meta.dir, '../templates/migrations', file), 'utf8')).toBe(sql)
+  })
+})
+
+describe('npm run setup', () => {
+  // npm and npx stand-ins on PATH log each call and answer wrangler's lists, so
+  // setup runs end to end without Cloudflare.
+  function runSetup(kits: readonly string[]): string[] {
+    const dir = mkdtempSync(join(tmpdir(), 'coa-setup-'))
+    try {
+      write(join(dir, 'app'), plan({ name: 'desk', kits: [...kits], devSecret: 's' }).files)
+      const bin = join(dir, 'bin')
+      mkdirSync(bin)
+      const log = join(dir, 'calls.log')
+      const fake = (answers: string) => `#!/bin/sh\necho "$(basename "$0") $*" >> "${log}"\n${answers}\nexit 0\n`
+      writeFileSync(join(bin, 'npm'), fake(''), { mode: 0o755 })
+      writeFileSync(
+        join(bin, 'npx'),
+        fake(
+          [
+            'case "$*" in',
+            `  *"d1 list"*) echo '[{"name":"desk","uuid":"d1-id"}]' ;;`,
+            `  *"kv namespace list"*) echo '[{"title":"desk-kv","id":"kv-id"}]' ;;`,
+            `  *"secret list"*) echo '[{"name":"GUARD_SECRET"}]' ;;`,
+            '  *" deploy"*) echo "https://desk.example.workers.dev" ;;',
+            'esac',
+          ].join('\n'),
+        ),
+        { mode: 0o755 },
+      )
+      execFileSync('node', ['scripts/setup.mjs'], { cwd: join(dir, 'app'), env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdio: 'pipe' })
+      return readFileSync(log, 'utf8').trim().split('\n')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  test('builds the page before anything else, so the deploy ships it', () => {
+    const calls = runSetup(PRESETS.full)
+    expect(calls[0]).toBe('npm run --silent build:page')
+    expect(calls.findIndex((c) => c === 'npx wrangler deploy')).toBeGreaterThan(0)
+  })
+
+  test('without a page there is nothing to build', () => {
+    const calls = runSetup(PRESETS.minimal)
+    expect(calls.some((c) => c.startsWith('npm '))).toBe(false)
+    expect(calls).toContain('npx wrangler deploy')
   })
 })
 

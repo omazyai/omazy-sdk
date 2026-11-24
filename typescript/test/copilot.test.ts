@@ -717,6 +717,7 @@ describe('the actor hand-off', () => {
     expect(offered.filter((n) => n === 'actor_start').length).toBe(1)
     expect(offered).not.toContain('actor_reply')
     expect(offered).not.toContain('actor_status')
+    expect(offered).not.toContain('actor_confirm')
 
     const t2 = await say(w, 'host')
     expect(copilotCalls(w).length).toBe(before)

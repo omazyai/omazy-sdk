@@ -275,7 +275,7 @@ function wranglerConfig(o, kits) {
     ...(has('copilot') ? { assets: { directory: './public', binding: 'ASSETS', run_worker_first: true } } : {}),
     vars: {
       DOOR_DEFAULT: 'off',
-      ...(has('ai') ? { OMAZY_BASE_URL: 'https://mw.omazy.ai/api/v1' } : {}),
+      ...(has('ai') ? { OMAZY_BASE_URL: 'https://mw.omazy.ai/api/v1/core' } : {}),
       ...(has('oauth') ? { OAUTH: 'off', ISSUER: '' } : {}),
     },
     observability: { enabled: true },
@@ -301,6 +301,8 @@ function devVars(kits, secret) {
     '# Local values for `wrangler dev`. Never commit this file.',
     `GUARD_SECRET=${secret}`,
     'DOOR_DEFAULT=on',
+    '# Approval codes print to this console. Only here: production sends them by mail or SMS.',
+    'STEP_UP_LOG=1',
   ]
   if (kits.includes('ai')) lines.push('# A Core API token from your Omazy workspace (Settings, then API keys).', 'OMAZY_TOKEN=')
   if (kits.includes('oauth')) lines.push('OAUTH=off', 'ISSUER=http://localhost:8787')

@@ -65,6 +65,12 @@ function appFor(env: Env): App {
     switches: d1Switches(env.DB, { cacheMs: 2000 }),
     secret: env.GUARD_SECRET,
     doorDefault: env.DOOR_DEFAULT === 'on' ? 'on' : 'off',
+    // Wire your mail or SMS sender here. STEP_UP_LOG=1 in .dev.vars prints the
+    // code to the wrangler dev console instead; never set it in production.
+    sendCode: (ctx, _channel, code) => {
+      if (env.STEP_UP_LOG !== '1') throw new Error('no code sender: wire mail or SMS in src/index.ts')
+      console.log(`approval code for ${ctx.principal.id}: ${code}`)
+    },
 //#if oauth
     ...(oauth ? oauth.door(DOOR) : { resolveSeat: async (token: string) => (await keys.resolve(token, DOOR))?.grant ?? null }),
 //#else

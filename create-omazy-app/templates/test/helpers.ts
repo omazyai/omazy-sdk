@@ -52,6 +52,8 @@ export function harness(o: HarnessOptions = {}) {
   let runner: MemoryRunner | undefined
 //#endif
   const pending: Promise<unknown>[] = []
+  /** The last approval code sent to each person, as a mail sender would deliver it. */
+  const codes = new Map<string, string>()
   const app = buildApp({
     notes,
     guardStore,
@@ -59,6 +61,7 @@ export function harness(o: HarnessOptions = {}) {
     switches,
     secret: SECRET,
     doorDefault: o.doorDefault ?? 'on',
+    sendCode: (ctx, _channel, code) => void codes.set(ctx.principal.id, code),
     resolveSeat: async (token) => (await keys.resolve(token, DOOR))?.grant ?? null,
 //#if ai
     omazy: () => o.core ?? fake.client,
@@ -120,6 +123,7 @@ export function harness(o: HarnessOptions = {}) {
     log,
     switches,
     guardStore,
+    codes,
 //#if ai
     fake,
 //#endif

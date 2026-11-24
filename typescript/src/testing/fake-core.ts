@@ -111,7 +111,22 @@ export interface FakeCore {
   push(...answers: (FakeAnswer | FakeResponder)[]): void
   /** Drops the replies left in the script. Rules and calls stay. */
   clear(): void
-  /** A reply for every request this rule matches, ahead of the script. A string matches the `unit` tag. */
+  /**
+   * A reply for requests this rule matches, ahead of the script. A string
+   * matches the `unit` tag.
+   *
+   * Without `times`, the rule answers every later request it matches, for
+   * the rest of the test: a second `on()` for the same unit never fires,
+   * because rules are tried in the order they were added and the first one
+   * that matches and has answers left wins. To give one turn its reply and
+   * the next turn another, pass `{ times: 1 }` to each:
+   *
+   *     fake.on('booking_intake', reply.json({ items: [first] }), { times: 1 })
+   *     fake.on('booking_intake', reply.json({ items: [second] }), { times: 1 })
+   *
+   * A rule whose `times` are spent stops matching, and the request falls to
+   * the next rule, then the script, then `fallback`.
+   */
   on(match: string | ((req: FakeRequest) => boolean), answer: FakeAnswer | FakeResponder, opts?: { times?: number }): void
   /** Forgets calls, spend, rules and the script left. */
   reset(): void

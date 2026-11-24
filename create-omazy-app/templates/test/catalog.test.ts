@@ -80,6 +80,7 @@ describe('catalog', () => {
         'actor_start',
         'actor_reply',
         'actor_status',
+        'actor_confirm',
 //#endif
       ],
       effects: () => h.notes.count(),

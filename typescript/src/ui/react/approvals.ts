@@ -5,7 +5,7 @@
 
 import { createElement as h, type KeyboardEvent, type ReactNode, useEffect, useId, useState } from 'react'
 import { formatDate, formatNumber } from '../text.js'
-import type { ApprovalItem, DecideBody, DecideResult } from '../types.js'
+import type { ApprovalItem, CodeSent, DecideBody, DecideResult } from '../types.js'
 import { approvalView, personName } from '../views.js'
 import { cx, Diff, Heading, type HeadingLevel, listKeys, Loadable } from './bits.js'
 import { useUi } from './context.js'
@@ -19,6 +19,86 @@ export interface StepUpSlotProps {
   done(proof: { method: string; [extra: string]: unknown }): void
   /** Call when the person gives up; focus returns to Approve. */
   cancel(): void
+}
+
+/**
+ * A ready step-up slot for the guard's `codeStepUp`: a button that asks
+ * `uiRoutes` (with `approvals.codes`) to send the decider a code, then a field
+ * for each channel the code went to. The kit only carries the code from the
+ * field to the decide call; the product's `send` delivers it by email or SMS.
+ *
+ *     h(ApprovalsInbox, { stepUp: (s) => h(CodeStepUpForm, s) })
+ */
+export function CodeStepUpForm(p: StepUpSlotProps): ReactNode {
+  const { text, ui } = useUi()
+  const id = useId()
+  const [sent, setSent] = useState<CodeSent | null>(null)
+  const [codes, setCodes] = useState<Record<string, string>>({})
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const first = useFocusAfter<HTMLInputElement>()
+  const send = async () => {
+    if (!ui) return
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await ui.approvals.sendCode(p.approval.id)
+      setSent(r)
+      setCodes({})
+      first.focus()
+    } catch (e) {
+      setError((e as Error)?.message || text.errorGeneric)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const submit = (e: { preventDefault(): void }) => {
+    e.preventDefault()
+    if (!sent) return
+    const given = Object.fromEntries(sent.channels.map((ch) => [ch, (codes[ch] ?? '').trim()]))
+    if (Object.values(given).some((v) => !v)) {
+      setError(text.codeRequired)
+      first.focus()
+      return
+    }
+    p.done({ method: sent.method, codes: given })
+  }
+  const cancel = h('button', { key: 'c', type: 'button', className: 'omz-btn', disabled: busy, onClick: p.cancel }, text.cancel)
+  const err = error ? h('p', { key: 'e', className: 'omz-error', role: 'alert' }, error) : null
+  if (!sent)
+    return h('div', { className: 'omz-section' }, err, h('div', { className: 'omz-card__actions' }, h('button', { type: 'button', className: 'omz-btn omz-btn--primary', disabled: busy || !ui, onClick: () => void send() }, text.codeSend), cancel))
+  const list = new Intl.ListFormat(text.locale, { type: 'conjunction' }).format(sent.channels)
+  return h(
+    'form',
+    { className: 'omz-section', onSubmit: submit },
+    h('p', { className: 'omz-note', role: 'status' }, text.codeSent(list)),
+    err,
+    sent.channels.map((ch, i) =>
+      h(
+        'label',
+        { key: ch, className: 'omz-field' },
+        h('span', null, text.codeLabel(sent.channels.length > 1 ? ch : null)),
+        h('input', {
+          ref: i === 0 ? first.ref : undefined,
+          id: `${id}-${ch}`,
+          value: codes[ch] ?? '',
+          inputMode: 'numeric',
+          autoComplete: 'one-time-code',
+          spellCheck: false,
+          'aria-required': true,
+          disabled: busy,
+          onChange: (e: { target: { value: string } }) => setCodes((c) => ({ ...c, [ch]: e.target.value })),
+        }),
+      ),
+    ),
+    h(
+      'div',
+      { className: 'omz-card__actions' },
+      h('button', { type: 'submit', className: 'omz-btn omz-btn--primary', disabled: busy }, text.codeSubmit),
+      h('button', { type: 'button', className: 'omz-btn', disabled: busy, onClick: () => void send() }, text.codeResend),
+      cancel,
+    ),
+  )
 }
 
 export interface ApprovalDetailProps {

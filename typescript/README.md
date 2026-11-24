@@ -18,7 +18,7 @@ npm install @omazyai/sdk
 Without a GitHub token, install the same build from the release:
 
 ```sh
-npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.1/omazyai-sdk-0.5.1.tgz
+npm install https://github.com/omazyai/omazy-sdk/releases/download/v0.5.2/omazyai-sdk-0.5.2.tgz
 ```
 
 ## Use

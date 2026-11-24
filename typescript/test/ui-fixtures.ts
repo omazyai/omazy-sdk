@@ -5,7 +5,7 @@
 import { type BaseCtx, defineCapabilities, registry, schema } from '../src/capabilities/index'
 import { createMemory, memoryMemoryStore } from '../src/ai/index'
 import { createGrants, memoryGrantStore } from '../src/copilot/index'
-import { approver, createGuard, memoryGuardStore, policies } from '../src/guard/index'
+import { approver, codeStepUp, createGuard, memoryGuardStore, policies, type StepUpVerifier } from '../src/guard/index'
 import { uiClient } from '../src/ui/index'
 import { type AppsSource, uiRoutes } from '../src/ui/server'
 
@@ -47,16 +47,20 @@ export const ctxOf = (id: string, channel = 'console', tenant = 'tA'): BaseCtx =
   requestId: `req_${id}`,
 })
 
-export function kit() {
+/** `codes`: the owner policy asks for the guard's `codeStepUp` instead of a passkey, and `sent` holds each code it sends. */
+export function kit(o: { codes?: boolean } = {}) {
   const store = memoryGuardStore()
+  const sent: { person: string; channel: string; code: string; approval: string }[] = []
+  const codes = o.codes ? codeStepUp<BaseCtx>({ store, send: (ctx, channel, code, b) => void sent.push({ person: ctx.principal.id, channel, code, approval: b.approvalId }) }) : undefined
+  const passkey: StepUpVerifier<BaseCtx> = { methods: ['passkey'], verify: async (_c, proof) => (proof.assertion === 'good' ? { ok: true, method: 'passkey' } : { ok: false, reason: 'The passkey did not match.' }) }
   const guard = createGuard<BaseCtx, Perm>({
     registry: reg,
     can: () => true,
     secret: 'test-secret-test-secret-test-secret-0123',
     store,
-    policies: { owner: policies.single({ approver: approver.role('owner'), stepUp: 'passkey', expires: '24h' }) },
+    policies: { owner: policies.single({ approver: approver.role('owner'), stepUp: codes ? 'code' : 'passkey', expires: '24h' }) },
     rolesOf: (c) => (c.principal.id === 'owner' ? ['owner'] : []),
-    stepUp: { methods: ['passkey'], verify: async (_c, proof) => (proof.assertion === 'good' ? { ok: true, method: 'passkey' } : { ok: false, reason: 'The passkey did not match.' }) },
+    stepUp: codes ?? passkey,
     reviewUrl: (a) => `/approvals/${a.id}`,
   })
   const mem = createMemory<BaseCtx>({ store: memoryMemoryStore() })
@@ -70,10 +74,10 @@ export function kit() {
     revokeApp: async (_p, id) => (id === 'g1' ? (revoked.push(id), true) : false),
     keys: { revoke: async (_p, id) => (id === 'k1' ? (revoked.push(id), true) : false) },
   }
-  const routes = uiRoutes<BaseCtx>({ approvals: { guard, store, reviewUrl: (a) => `/approvals/${a.id}` }, apps, memory: mem, grants, registry: reg })
+  const routes = uiRoutes<BaseCtx>({ approvals: { guard, store, reviewUrl: (a) => `/approvals/${a.id}`, ...(codes ? { codes } : {}) }, apps, memory: mem, grants, registry: reg })
   /** A fetch that answers `/ui/...` from the routes as this person. */
   const fetchFor = (ctx: BaseCtx) =>
     (async (url: string, init?: RequestInit) => (await routes.handle(new Request(`https://app.example${url}`, init), ctx)) ?? new Response('no route', { status: 404 })) as unknown as typeof fetch
   const clientFor = (ctx: BaseCtx) => uiClient({ fetch: fetchFor(ctx) })
-  return { guard, store, mem, grants, routes, fetchFor, clientFor, revoked }
+  return { guard, store, mem, grants, routes, fetchFor, clientFor, revoked, sent }
 }

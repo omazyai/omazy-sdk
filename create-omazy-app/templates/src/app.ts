@@ -14,7 +14,7 @@ import { type CopilotThreadStore, createCopilot, createGrants, type GrantStore }
 //#if flow
 import { createFlows, type FlowDeps, type FlowStarter, type FlowStore } from '@omazyai/sdk/flows'
 //#endif
-import type { Guard, GuardStore, RequestLogSink, SwitchStore } from '@omazyai/sdk/guard'
+import { codeStepUp, type Guard, type GuardStore, type RequestLogSink, type StepUpBinding, type SwitchStore } from '@omazyai/sdk/guard'
 //#if copilot
 import type { SeatGrant } from '@omazyai/sdk/mcp'
 //#endif
@@ -52,6 +52,11 @@ export interface AppParts {
   switches: SwitchStore
   secret: string
   doorDefault: 'on' | 'off'
+  /**
+   * Sends whoever decides an approval their one-time code (the guard's
+   * codeStepUp). Mail or a text message in production.
+   */
+  sendCode: (ctx: AppCtx, channel: string, code: string, binding: StepUpBinding) => void | Promise<void>
 //#if oauth
   /** Turns a bearer token into a seat: personal keys, and OAuth tokens when it is on. */
 //#else
@@ -91,12 +96,15 @@ export function buildApp(p: AppParts, wrapGuard: (g: Guard<AppCtx>) => Guard<App
 //#if copilot
   let copilotRef: ReturnType<typeof createCopilot<AppCtx>> | undefined
 //#endif
+  // An approver proves it is them with a code sent to their email.
+  const codes = codeStepUp<AppCtx>({ store: p.guardStore, send: p.sendCode })
   const guard = wrapGuard(buildGuard({
     store: p.guardStore,
     log: p.log,
     switches: p.switches,
     secret: p.secret,
     doorDefault: p.doorDefault,
+    stepUp: [codes],
 //#if flow || copilot
     // An approval's events move a waiting workflow step and the copilot's approval card.
     onApproval: async (e) => {
@@ -160,10 +168,13 @@ export function buildApp(p: AppParts, wrapGuard: (g: Guard<AppCtx>) => Guard<App
     standingGrants: grants,
   })
   copilotRef = copilot
-  const ui = uiRoutes<AppCtx>({ grants, registry: reg, approvals: { guard, store: p.guardStore }, memory: ai.memory })
+  // `codes` serves POST /ui/approvals/<id>/code, which the page's CodeStepUpForm calls.
+  const ui = uiRoutes<AppCtx>({ grants, registry: reg, approvals: { guard, store: p.guardStore, codes }, memory: ai.memory })
 //#endif
   return {
     guard,
+    /** Starts an approver's code; the page asks for one through `ui`. */
+    codes,
     door,
 //#if ai
     ai,

@@ -126,6 +126,16 @@ export interface DecideResult {
   execution?: { outcome: string; message?: string }
 }
 
+/** What `POST …/approvals/<id>/code` answers: where the step-up code went, and the method to prove it with. */
+export interface CodeSent {
+  /** The channels a code went to, such as `email`. One code each; every one is needed. */
+  channels: string[]
+  /** The step-up method the codes prove, such as `code`, for the decide's `proof`. */
+  method: string
+  /** ISO time the codes stop working. */
+  expiresAt: string
+}
+
 // ---------------------------------------------------------------- connected apps
 
 export interface AppItem {

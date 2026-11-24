@@ -53,7 +53,7 @@ export class McpClient {
   initialize(protocolVersion = '2025-06-18') {
     return this.rpc<{ protocolVersion: string; serverInfo: { name: string; version: string }; instructions?: string }>(
       'initialize',
-      { protocolVersion, capabilities: {}, clientInfo: { name: '@omazyai/sdk', version: '0.5.1' } },
+      { protocolVersion, capabilities: {}, clientInfo: { name: '@omazyai/sdk', version: '0.5.2' } },
     )
   }
 

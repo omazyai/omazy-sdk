@@ -5,6 +5,7 @@
 //
 //   GET  <base>/approvals?status=waiting|all|<status>
 //   GET  <base>/approvals/<id>
+//   POST <base>/approvals/<id>/code     sends the decider a step-up code (with `approvals.codes`)
 //   POST <base>/approvals/<id>/decide   { approve, reason?, typedTarget?, proof? }
 //   GET  <base>/apps                    connected apps and keys
 //   POST <base>/apps/<grantId>/revoke
@@ -21,11 +22,12 @@
 
 import type { BaseCtx } from '../capabilities/capability.js'
 import type { Registry } from '../capabilities/registry.js'
+import type { CodeStepUp } from '../guard/stepup.js'
 import type { ApprovalRow, ApprovalStatus, Guard, GuardStore } from '../guard/types.js'
 import { describePolicy } from '../guard/policies.js'
 import type { Memory, MemoryRow } from '../ai/memory.js'
 import { type Grants, MAX_GRANT_DAILY_CAP, MAX_GRANT_DAYS, type StandingGrant } from '../copilot/grants.js'
-import type { AppItem, ApprovalItem, DecideResult, GrantItem, KeyItem, MemoryItem } from './types.js'
+import type { AppItem, ApprovalItem, CodeSent, DecideResult, GrantItem, KeyItem, MemoryItem } from './types.js'
 
 /** What the connected apps page needs from the oauth kit's server. `createOAuthServer` gives all three. */
 export interface AppsSource {
@@ -45,6 +47,14 @@ export interface UiRoutesOptions<C extends BaseCtx> {
     reviewUrl?: (a: ApprovalRow) => string | undefined
     /** Widens who may see a row, such as a tenant's owners seeing every request of the tenant. */
     canSee?: (ctx: C, a: ApprovalRow) => boolean | Promise<boolean>
+    /**
+     * The guard's `codeStepUp`, the same one given to `createGuard`'s
+     * `stepUp`. With it, `POST …/approvals/<id>/code` sends a code to whoever
+     * may decide the approval now, and `CodeStepUpForm` asks for it. Each
+     * call sends a fresh code and the earlier one stops working; limit how
+     * often a person may ask, as for any message you send.
+     */
+    codes?: Pick<CodeStepUp<C>, 'start' | 'methods'>
   }
   /** The connected apps page: `createOAuthServer(...)`. */
   apps?: AppsSource
@@ -137,6 +147,18 @@ export function uiRoutes<C extends BaseCtx>(o: UiRoutesOptions<C>): UiRoutes<C> 
       const row = await a.guard.approval(id)
       const item = row ? await approvalItem(ctx, row) : null
       return item ? json({ approval: item }) : json({ approval: null }, 404)
+    }
+    if (req.method === 'POST' && rest.length === 2 && rest[1] === 'code') {
+      if (!a.codes) return null
+      const row = await a.guard.approval(id)
+      if (!row || !(await approvalItem(ctx, row))) return fail(404, 'not_found', 'There is no such request.')
+      if (row.status !== 'waiting') return fail(409, 'already_decided', 'This request is no longer waiting.')
+      const may = await a.guard.canDecide(row.id, ctx)
+      if (!may.ok) return fail(403, 'not_allowed', may.message)
+      const method = a.codes.methods.find((m) => row.rule.stepUp.includes(m))
+      if (!method) return fail(400, 'no_code', `This request is verified with ${row.rule.stepUp.join(' or ')}, not a code.`)
+      const sent = await a.codes.start(ctx, row)
+      return json({ channels: [...sent.channels], method, expiresAt: new Date(sent.expiresAt).toISOString() } satisfies CodeSent)
     }
     if (req.method === 'POST' && rest.length === 2 && rest[1] === 'decide') {
       const body = (await req.json().catch(() => null)) as Record<string, unknown> | null

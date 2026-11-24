@@ -77,8 +77,9 @@ npx wrangler login
 npm run setup
 ```
 
-`setup` creates the D1 database and the KV namespace on your Cloudflare account, writes their ids
-into `wrangler.jsonc`, applies the migrations, deploys and sets `GUARD_SECRET`. It prints the
+`setup` builds the page when the product has one, creates the D1 database and the KV namespace on
+your Cloudflare account, writes their ids into `wrangler.jsonc`, applies the migrations, deploys
+and sets `GUARD_SECRET`. It prints the
 Worker's URL. Run it again safely; after that, `npm run deploy` ships changes and
 `npm run migrate:remote` applies new migrations.
 
@@ -98,6 +99,13 @@ claude mcp add --transport http %%name%% https://%%name%%.<your-subdomain>.worke
 ```
 
 `npm run door -- off --remote` stops every request within a few seconds, whatever the client.
+
+### Approval codes
+
+Whoever decides an approval proves it is them with a one-time code (the guard's `codeStepUp`).
+`sendCode` in `src/index.ts` delivers it. Locally, `STEP_UP_LOG=1` in `.dev.vars` prints it to the
+`wrangler dev` console. In production nothing sends it until you wire your mail or SMS sender
+there: until then, asking for a code fails rather than print it to the Worker's logs.
 //#if ai
 
 ### The model calls

@@ -61,7 +61,7 @@ export {
 export type * from './types.js'
 
 export const DEFAULT_BASE_URL = 'https://mw.omazy.ai/api/v1/core'
-export const VERSION = '0.5.1'
+export const VERSION = '0.5.2'
 
 export interface OmazyOptions {
   /** An install token, `cai_<prefix>.<secret>`. Server side only. */

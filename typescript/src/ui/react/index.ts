@@ -19,5 +19,5 @@ export {
   type MemorySuggestionProps,
 } from './cards.js'
 export { CopilotPanel, type CopilotPanelProps } from './panel.js'
-export { ApprovalDetail, type ApprovalDetailProps, ApprovalsInbox, type ApprovalsInboxProps, type StepUpSlotProps } from './approvals.js'
+export { ApprovalDetail, type ApprovalDetailProps, ApprovalsInbox, type ApprovalsInboxProps, CodeStepUpForm, type StepUpSlotProps } from './approvals.js'
 export { ConnectedApps, MemoryPage, StandingGrants } from './pages.js'
