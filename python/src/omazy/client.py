@@ -17,7 +17,7 @@ from .routes import IDEMPOTENT, RETRYABLE, ROUTES
 from .stt import TranscriptionSession, open_transcription
 
 DEFAULT_BASE_URL = "https://mw.omazy.ai/api/v1/core"
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 Json = Dict[str, Any]
 
@@ -920,9 +920,10 @@ class _Usage:
 
         ``from_`` and ``to`` are days as ``YYYY-MM-DD``, both included; the
         last 30 days by default, at most 90. The answer has ``totals`` and
-        ``days``: model calls, cache hits, tokens, speech, cost in
-        ``cost_micros``, and the plan's counters (conversations, AI turns,
-        API calls, voice minutes).
+        ``days``: model calls, cache hits, tokens, speech, the base cost in
+        ``cost_micros`` (``vendor_cost_micros`` plus the Omazy service fee in
+        ``fee_micros``; Omazy sets it, add your margin to it), and the plan's
+        counters (conversations, AI turns, API calls, voice minutes).
         """
         return self._c._json("usage.get", query={"from": from_, "to": to, "group_by": group_by, "unit": unit, "run_id": run_id})
 

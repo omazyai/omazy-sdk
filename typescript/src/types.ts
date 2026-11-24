@@ -755,9 +755,17 @@ export interface UsageTotals {
   speech_sessions: number
   /** Seconds of audio heard or spoken. */
   speech_seconds: number
-  /** What the calls cost, in millionths of a US dollar. Calls on the workspace's own provider key are not in it. */
+  /**
+   * The base cost of the calls, in millionths of a US dollar: vendor_cost_micros
+   * plus fee_micros. Omazy sets it. Calls on the workspace's own provider key are
+   * not in it. Add your own margin to this; keep no copy of vendor prices.
+   */
   cost_micros: number
   cost_usd: number
+  /** The vendors' published price for the calls, from Omazy's rate cards. */
+  vendor_cost_micros: number
+  /** The Omazy service fee on top of the vendor price. Speech carries it; model calls carry none. */
+  fee_micros: number
   /** The part of cost_micros priced from an estimate. */
   estimated_cost_micros: number
   /** Calls with no price at all, not in cost_micros. */
@@ -814,6 +822,8 @@ export interface UsageGroup {
   speech_seconds: number
   cost_micros: number
   cost_usd: number
+  vendor_cost_micros: number
+  fee_micros: number
   estimated_cost_micros: number
   unpriced_calls: number
 }

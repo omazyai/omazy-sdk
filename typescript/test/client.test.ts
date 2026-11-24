@@ -791,7 +791,7 @@ describe('contract', () => {
 })
 
 describe('usage', () => {
-  const day = { model_calls: 2, cache_hits: 1, errors: 0, input_tokens: 10, output_tokens: 2, cached_input_tokens: 4, speech_sessions: 0, speech_seconds: 0, cost_micros: 1500, cost_usd: 0.0015, estimated_cost_micros: 0, unpriced_calls: 0, conversations: 1, ai_turns: 2, api_calls: 3, voice_minutes: 0 }
+  const day = { model_calls: 2, cache_hits: 1, errors: 0, input_tokens: 10, output_tokens: 2, cached_input_tokens: 4, speech_sessions: 0, speech_seconds: 0, cost_micros: 1500, cost_usd: 0.0015, vendor_cost_micros: 1250, fee_micros: 250, estimated_cost_micros: 0, unpriced_calls: 0, conversations: 1, ai_turns: 2, api_calls: 3, voice_minutes: 0 }
   const report = { workspace_id: 'w1', from: '2026-11-22', to: '2026-11-22', totals: day, days: [{ date: '2026-11-22', ...day }] }
 
   test('get sends the range and reads the report', async () => {

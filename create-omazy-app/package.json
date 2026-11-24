@@ -1,6 +1,6 @@
 {
   "name": "create-omazy-app",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Creates an AI product on the Omazy SDK kits: a Cloudflare Worker with capabilities, the guard and an MCP door, ready to deploy.",
   "keywords": [
     "omazy",

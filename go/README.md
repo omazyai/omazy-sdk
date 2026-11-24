@@ -5,7 +5,7 @@ Go client for the [Omazy Core API](https://docs.omazy.ai/reference/core-api/). S
 ## Install
 
 ```sh
-go get github.com/omazyai/omazy-sdk/go@v0.5.2
+go get github.com/omazyai/omazy-sdk/go@v0.5.3
 ```
 
 ```go

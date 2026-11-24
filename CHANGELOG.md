@@ -2,6 +2,14 @@
 
 The TypeScript, Python and Go clients share one version number.
 
+## 0.5.3 (2026-11-24)
+
+Usage reports the base cost and its parts. Every kit stays a preview: pin the exact version.
+
+Upgrading from 0.5.2: nothing to change.
+
+- Usage answers (`usage.get`, the enterprise `usage`) carry `vendor_cost_micros` and `fee_micros` next to `cost_micros`. `cost_micros` is now the base cost Omazy sets: the vendor's published price for each call plus the Omazy service fee on speech. Speech to text is priced per second, text to speech per character. A platform that bills its own customers adds its margin to `cost_micros` and keeps no copy of vendor prices. The TypeScript and Go types gain the two fields; Python returns them in the same dicts. Additive: nothing to change.
+
 ## 0.5.2 (2026-11-24)
 
 Fixes from running the "Build an AI product in a day" tutorial end to end. Every kit stays a preview: pin the exact version.

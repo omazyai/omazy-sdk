@@ -19,10 +19,16 @@ type UsageTotals struct {
 	// SpeechSessions and SpeechSeconds are speech to text and text to speech.
 	SpeechSessions uint64  `json:"speech_sessions"`
 	SpeechSeconds  float64 `json:"speech_seconds"`
-	// CostMicros is what the calls cost, in millionths of a US dollar. Calls
-	// on the workspace's own provider key are not in it.
+	// CostMicros is the base cost of the calls, in millionths of a US dollar:
+	// VendorCostMicros plus FeeMicros. Omazy sets it. Calls on the
+	// workspace's own provider key are not in it. Add your own margin to it;
+	// keep no copy of vendor prices.
 	CostMicros uint64  `json:"cost_micros"`
 	CostUSD    float64 `json:"cost_usd"`
+	// VendorCostMicros is the vendors' published price for the calls.
+	VendorCostMicros uint64 `json:"vendor_cost_micros"`
+	// FeeMicros is the Omazy service fee on top. Speech carries it.
+	FeeMicros uint64 `json:"fee_micros"`
 	// EstimatedCostMicros is the part of CostMicros priced from an estimate.
 	EstimatedCostMicros uint64 `json:"estimated_cost_micros"`
 	// UnpricedCalls had no price and are not in CostMicros.
